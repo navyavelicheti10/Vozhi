@@ -5,4 +5,5 @@ __pycache__/
 checkpoints/
 qdrant_data/
 tmp_qdrant_test/
+.vscode/
 
