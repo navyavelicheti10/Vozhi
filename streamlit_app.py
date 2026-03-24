@@ -1,11 +1,14 @@
 import os
 from typing import Any, Dict, List
-
+from dotenv import load_dotenv
 import requests
 import streamlit as st
 
+load_dotenv()
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+
+DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
+API_BASE_URL = os.getenv("API_BASE_URL", DEFAULT_API_BASE_URL).strip()
 CHAT_ENDPOINT = f"{API_BASE_URL}/chat"
 SESSION_ENDPOINT = f"{API_BASE_URL}/sessions"
 
@@ -64,7 +67,7 @@ if "archived_chats" not in st.session_state:
 
 with st.sidebar:
     st.header("Settings")
-    api_url = st.text_input("FastAPI URL", value=API_BASE_URL)
+    api_url = st.text_input("FastAPI URL", value=API_BASE_URL).strip() or DEFAULT_API_BASE_URL
     top_k = st.slider("Top K Schemes", min_value=1, max_value=5, value=3)
 
     if st.button("Start New Chat"):
@@ -157,5 +160,11 @@ if user_query:
             except requests.HTTPError as exc:
                 error_text = exc.response.text if exc.response is not None else str(exc)
                 st.error(f"API error: {error_text}")
+            except requests.ConnectionError:
+                st.error(
+                    "Could not reach the FastAPI backend. Start it with "
+                    "`uvicorn main:app --host 127.0.0.1 --port 8000` "
+                    "or update the FastAPI URL in the sidebar."
+                )
             except Exception as exc:
                 st.error(f"Something went wrong: {exc}")
