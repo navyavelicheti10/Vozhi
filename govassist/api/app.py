@@ -12,6 +12,13 @@ from langchain_core.messages import HumanMessage
 from fastapi import Request, BackgroundTasks
 from pydantic import BaseModel, Field
 
+from govassist.api.db import init_db, get_all_sessions, get_session, save_session
+
+class SaveSessionRequest(BaseModel):
+    session_id: str
+    title: str
+    messages: list
+
 # Ensure env vars are loaded
 load_env_file()
 
@@ -43,6 +50,7 @@ class ChatResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Vozhi API (LangGraph Edition)")
+    init_db()
     yield
     logger.info("Shutting down Vozhi API")
 
@@ -80,6 +88,25 @@ def serve_web_app() -> FileResponse:
         raise HTTPException(status_code=404, detail="Web UI not found. Create web/index.html.")
     return FileResponse(index_file)
 
+@app.get("/api/sessions")
+def api_get_sessions():
+    """Returns a list of all chat sessions for the UI sidebar."""
+    return get_all_sessions()
+
+@app.get("/api/sessions/{session_id}")
+def api_get_session(session_id: str):
+    """Returns the full message history array for a session."""
+    msgs = get_session(session_id)
+    if msgs is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"messages": msgs}
+
+@app.post("/api/sessions")
+def api_save_session(req: SaveSessionRequest):
+    """Saves or updates the UI chat array into the SQLite database."""
+    save_session(req.session_id, req.title, req.messages)
+    return {"status": "ok"}
+
 
 @app.post("/chat")
 def chat(request: ChatRequest):
@@ -112,8 +139,8 @@ from govassist.integrations.twilio import twilio_client
 from fastapi import Response
 
 @app.post("/whatsapp")
-async def twilio_webhook(request: Request):
-    """Handles incoming Twilio WhatsApp messages."""
+async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Handles incoming Twilio WhatsApp messages instantly to avoid 15s timeouts."""
     form_data = dict(await request.form())
     parsed = twilio_client.parse_incoming_message(form_data)
     
@@ -123,17 +150,23 @@ async def twilio_webhook(request: Request):
     if not sender:
         return Response(content="<Response></Response>", media_type="application/xml")
         
-    session_id = sender.replace("whatsapp:", "")
-    config = {"configurable": {"thread_id": session_id}}
-    
-    state_input = {"messages": [HumanMessage(content=body)], "current_query": body}
-    
-    try:
-        result_state = vozhi_orchestrator.invoke(state_input, config=config)
-        reply_text = result_state.get("final_package", "System Error while processing.")
-    except Exception as e:
-        logger.error(f"Error in graph: {e}")
-        reply_text = "Sorry, I am currently undergoing maintenance."
+    def process_and_reply(sender_id: str, query: str):
+        session_id = sender_id.replace("whatsapp:", "")
+        config = {"configurable": {"thread_id": session_id}}
+        state_input = {"messages": [HumanMessage(content=query)], "current_query": query}
         
-    twiml_resp = twilio_client.generate_twiml_response(reply_text)
-    return Response(content=twiml_resp, media_type="application/xml")
+        try:
+            result_state = vozhi_orchestrator.invoke(state_input, config=config)
+            reply_text = result_state.get("final_package", "System Error while processing.")
+        except Exception as e:
+            logger.error(f"Error in graph: {e}")
+            reply_text = "Sorry, I am currently undergoing maintenance."
+            
+        # Send back to Twilio async using REST API to prevent HTTP timeout
+        twilio_client.send_proactive_message(to_number=sender_id, message=reply_text)
+
+    # Queue the heavy LangGraph task
+    background_tasks.add_task(process_and_reply, sender, body)
+    
+    # Return empty TwiML instantly
+    return Response(content="<Response></Response>", media_type="application/xml")

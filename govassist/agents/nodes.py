@@ -111,12 +111,12 @@ def synthesis_agent(state: AgentState) -> Dict[str, Any]:
     prompt = f"""
     You are Vozhi, India's Intelligent Benefits Orchestrator.
     User Profile: {json.dumps(profile)}
-    User Query: {query}
     
     Retrieved Core Schemes: {json.dumps(trimmed_schemes, default=str)}
     Potential Synergies (Graph RAG): {json.dumps(synergies, default=str)}
     
-    Generate a highly accurate, bundled benefit package for the user.
+    Generate a highly accurate, bundled benefit package for the user based.
+    Answer the user's latest query using the provided context and previous chat history.
     1. Acknowledge their profile.
     2. Explain the primary scheme.
     3. Suggest bundle synergies to maximize benefits.
@@ -124,7 +124,9 @@ def synthesis_agent(state: AgentState) -> Dict[str, Any]:
     5. Be compassionate but authoritative.
     """
     
-    resp = llm.invoke([SystemMessage(content=prompt)])
+    sys_msg = SystemMessage(content=prompt)
+    recent_history = state.get("messages", [])[-6:] # Keep context window small to avoid TPM errors
+    resp = llm.invoke([sys_msg] + recent_history)
     
     # Mock confidence score calculation based on result density
     confidence = 92.5 if schemes else 45.0
