@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -20,6 +21,27 @@ embedding_service: EmbeddingService | None = None
 qdrant: QdrantManager | None = None
 graph_manager: GraphStoreManager | None = None
 ocr_reader = None
+
+GREETING_PATTERNS = (
+    re.compile(r"^\s*(hi|hii+|hello|hey|heyy+|namaste|namaskaram|good (morning|afternoon|evening))[\s!.?]*$", re.I),
+    re.compile(r"^\s*(bye|goodbye|see you|thanks|thank you|ok thanks|okay thanks|thx)[\s!.?]*$", re.I),
+)
+
+
+def _is_small_talk(query: str) -> bool:
+    candidate = clean_text(query or "").strip()
+    if not candidate:
+        return False
+    return any(pattern.fullmatch(candidate) for pattern in GREETING_PATTERNS)
+
+
+def _build_small_talk_response(query: str) -> str:
+    normalized = clean_text(query or "").strip().lower()
+    if any(token in normalized for token in ("bye", "goodbye", "see you")):
+        return "Goodbye. Reach out anytime if you want help finding the right government scheme."
+    if any(token in normalized for token in ("thanks", "thank you", "thx")):
+        return "You’re welcome. If you want, I can help you check eligibility or find a scheme by state, profession, or benefit type."
+    return "Hello. I can help you find relevant government schemes, check eligibility, or review uploaded documents."
 
 
 def _safe_json_loads(payload: str) -> Dict[str, Any]:
@@ -116,6 +138,78 @@ def _build_document_context(state: AgentState) -> str:
     return "\n".join(parts).strip()
 
 
+def _calculate_confidence(schemes: List[Dict[str, Any]]) -> float:
+    average_score = sum(float(scheme.get("score", 0.0) or 0.0) for scheme in schemes) / max(len(schemes), 1)
+    return round(min(max(average_score, 0.0), 1.0), 3)
+
+
+def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMessage]:
+    schemes = state.get("retrieved_schemes", [])
+    synergies = state.get("synergy_schemes", [])
+    documents_extracted = state.get("documents_extracted", {})
+    user_profile = state.get("user_profile", {})
+    current_query = state.get("current_query", "")
+
+    trimmed_schemes = [
+        {
+            "scheme_name": scheme.get("scheme_name", ""),
+            "category": scheme.get("category", ""),
+            "description": clean_text(scheme.get("description", ""))[:400],
+            "eligibility": clean_text(scheme.get("eligibility", ""))[:350],
+            "benefits": clean_text(scheme.get("benefits", ""))[:350],
+            "documents_required": scheme.get("documents_required", ""),
+            "application_process": clean_text(scheme.get("application_process", ""))[:240],
+            "official_link": scheme.get("official_link") or scheme.get("source", ""),
+            "score": scheme.get("score"),
+        }
+        for scheme in schemes
+    ]
+
+    system_prompt = (
+        "You are GovAssist, a precise assistant for Indian government schemes.\n"
+        "Answer using only the supplied retrieval context. Do not invent or assume missing facts.\n"
+        "Keep the response tight, readable, and decision-oriented.\n\n"
+        "Formatting rules:\n"
+        "- Use short Markdown sections with these headings when relevant: Best Match, Eligibility, Benefits, Documents Required, How to Apply, Also Consider, Next Step.\n"
+        "- Start with one sentence that directly answers the user.\n"
+        "- Focus on the single best-fit scheme first.\n"
+        "- Mention synergy schemes only if they are genuinely relevant and label them under Also Consider.\n"
+        "- Use plain language and short bullets under sections when useful.\n"
+        "- Add inline citations in this exact format: [Source: Scheme Name].\n"
+        "- If retrieval is weak or partial, say so briefly instead of filling gaps.\n"
+        "- Do not output JSON."
+    )
+    human_prompt = (
+        f"User query: {current_query}\n"
+        f"User profile: {json.dumps(user_profile, ensure_ascii=True)}\n"
+        f"Document context: {json.dumps(documents_extracted, ensure_ascii=True)}\n"
+        f"Retrieved schemes: {json.dumps(trimmed_schemes, ensure_ascii=True)}\n"
+        f"Synergy schemes: {json.dumps(synergies, ensure_ascii=True)}"
+    )
+    return [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=human_prompt),
+    ]
+
+
+def build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMessage]:
+    _get_or_init_clients()
+    return _build_post_rag_messages(state)
+
+
+def build_post_rag_metadata(state: AgentState) -> Dict[str, Any]:
+    schemes = state.get("retrieved_schemes", [])
+    citations = [
+        scheme.get("scheme_name")
+        for scheme in schemes
+        if clean_text(scheme.get("scheme_name"))
+    ]
+    return {
+        "citations": citations,
+        "confidence_score": _calculate_confidence(schemes),
+    }
+
+
 def _post_rag_response(state: AgentState) -> Dict[str, Any]:
     _get_or_init_clients()
 
@@ -138,46 +232,13 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content=fallback)],
         }
 
-    trimmed_schemes = [
-        {
-            "scheme_name": scheme.get("scheme_name", ""),
-            "category": scheme.get("category", ""),
-            "description": clean_text(scheme.get("description", ""))[:400],
-            "eligibility": clean_text(scheme.get("eligibility", ""))[:350],
-            "benefits": clean_text(scheme.get("benefits", ""))[:350],
-            "documents_required": scheme.get("documents_required", ""),
-            "application_process": clean_text(scheme.get("application_process", ""))[:240],
-            "official_link": scheme.get("official_link") or scheme.get("source", ""),
-            "score": scheme.get("score"),
-        }
-        for scheme in schemes
-    ]
-
-    prompt = (
-        "You are a government schemes assistant. Produce a structured, practical answer using only the supplied retrieval context.\n"
-        "Response requirements:\n"
-        "1. Start with the best-fit scheme and why it matches.\n"
-        "2. Mention eligibility, benefits, documents, and application steps.\n"
-        "3. Mention synergy schemes only if they are relevant.\n"
-        "4. Use simple, user-facing language.\n"
-        "5. End with a short next-step recommendation.\n"
-        "6. Include citations inline in the form [Source: Scheme Name].\n"
-        "7. Do not invent details.\n\n"
-        f"User query: {current_query}\n"
-        f"User profile: {json.dumps(user_profile, ensure_ascii=True)}\n"
-        f"Document context: {json.dumps(documents_extracted, ensure_ascii=True)}\n"
-        f"Retrieved schemes: {json.dumps(trimmed_schemes, ensure_ascii=True)}\n"
-        f"Synergy schemes: {json.dumps(synergies, ensure_ascii=True)}"
-    )
-
-    response = llm.invoke([SystemMessage(content=prompt)])
+    response = llm.invoke(_build_post_rag_messages(state))
     citations = [
         scheme.get("scheme_name")
         for scheme in schemes
         if clean_text(scheme.get("scheme_name"))
     ]
-    average_score = sum(float(scheme.get("score", 0.0) or 0.0) for scheme in schemes) / max(len(schemes), 1)
-    normalized_confidence = round(min(max(average_score, 0.0), 1.0), 3)
+    normalized_confidence = _calculate_confidence(schemes)
 
     return {
         "final_package": response.content.strip(),
@@ -222,6 +283,21 @@ def llm_agent(state: AgentState) -> Dict[str, Any]:
     if state.get("rag_completed"):
         logger.info("Running LLM agent in post-RAG synthesis mode")
         return _post_rag_response(state)
+
+    seed_query = clean_text(
+        state.get("raw_query", "") or state.get("transcribed_text", "") or state.get("current_query", "")
+    )
+    if _is_small_talk(seed_query):
+        logger.info("Short-circuiting small-talk query without RAG: %s", seed_query)
+        reply = _build_small_talk_response(seed_query)
+        return {
+            "current_query": seed_query,
+            "final_package": reply,
+            "confidence_score": 1.0,
+            "citations": [],
+            "rag_completed": True,
+            "messages": [AIMessage(content=reply)],
+        }
 
     logger.info("Running LLM agent in pre-RAG query refinement mode")
     return _pre_rag_query_refinement(state)

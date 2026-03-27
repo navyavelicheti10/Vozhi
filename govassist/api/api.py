@@ -3,17 +3,19 @@ import os
 import shutil
 import subprocess
 import sys
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
 from govassist.agents.graph import govassist_graph
+from govassist.agents import nodes as agent_nodes
 from govassist.api.db import delete_session, get_all_sessions, get_session, init_db as init_chat_db, save_session
 from govassist.api.db_utils import ingest_schemes_to_qdrant, init_db as init_schemes_db
 from govassist.config import load_env_file
@@ -120,6 +122,12 @@ def _format_chat_response(session_id: str, state: dict[str, Any]) -> dict[str, A
         "documents_extracted": state.get("documents_extracted", {}),
         "citations": state.get("citations", []),
     }
+
+
+def _merge_state(base_state: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base_state)
+    merged.update(updates)
+    return merged
 
 
 @asynccontextmanager
@@ -244,6 +252,73 @@ async def chat(request: Request):
     finally:
         if uploaded_file_path and uploaded_file_path.exists():
             uploaded_file_path.unlink(missing_ok=True)
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+    if not any(text_type in content_type for text_type in TEXT_MIME_TYPES):
+        raise HTTPException(status_code=415, detail="Streaming chat currently supports application/json text input only.")
+
+    payload = ChatJsonRequest.model_validate(await request.json())
+    session_id = payload.session_id or "default-session"
+    query_text = payload.query.strip()
+
+    state = _build_state(
+        input_type="text",
+        query_text=query_text,
+        session_id=session_id,
+    )
+
+    async def event_stream():
+        try:
+            llm_state = _merge_state(state, agent_nodes.llm_agent(state))
+
+            if llm_state.get("rag_completed") and llm_state.get("final_package"):
+                final_payload = _format_chat_response(session_id, llm_state)
+                yield json.dumps({"type": "chunk", "content": final_payload["answer"]}) + "\n"
+                yield json.dumps({"type": "final", "data": final_payload}) + "\n"
+                return
+
+            rag_state = _merge_state(llm_state, agent_nodes.rag_agent(llm_state))
+            agent_nodes._get_or_init_clients()
+            if agent_nodes.llm is None:
+                raise RuntimeError("LLM client could not be initialized for streaming.")
+
+            messages = agent_nodes.build_post_rag_messages(rag_state)
+            chunks: list[str] = []
+            async for chunk in agent_nodes.llm.astream(messages):
+                content = getattr(chunk, "content", "")
+                if isinstance(content, list):
+                    text = "".join(
+                        item.get("text", "") if isinstance(item, dict) else str(item)
+                        for item in content
+                    )
+                else:
+                    text = str(content or "")
+
+                if not text:
+                    continue
+
+                chunks.append(text)
+                yield json.dumps({"type": "chunk", "content": text}) + "\n"
+
+            final_text = "".join(chunks).strip()
+            metadata = agent_nodes.build_post_rag_metadata(rag_state)
+            final_state = _merge_state(
+                rag_state,
+                {
+                    "final_package": final_text,
+                    "citations": metadata["citations"],
+                    "confidence_score": metadata["confidence_score"],
+                },
+            )
+            yield json.dumps({"type": "final", "data": _format_chat_response(session_id, final_state)}) + "\n"
+        except Exception as exc:
+            logger.exception("Streaming chat request failed")
+            yield json.dumps({"type": "error", "detail": f"Chat orchestration failed: {exc}"}) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
 
 @app.post("/scrape")

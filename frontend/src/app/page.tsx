@@ -232,37 +232,84 @@ export default function VozhiApp() {
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setLoading(true);
+    const assistantId = `${Date.now()}-assistant`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+      },
+    ]);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/chat", {
+      const res = await fetch("http://127.0.0.1:8000/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: userMsg.content, session_id: session }),
       });
       if (!res.ok) throw new Error("API Error");
+      if (!res.body) throw new Error("Streaming body unavailable");
 
-      const data = await res.json();
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          role: "assistant",
-          content: data.answer,
-          matches: data.matches,
-          confidence: data.confidence,
-          citations:
-            data.matches?.map((match: SchemeMatch) => match.scheme_name).filter(Boolean) || [],
-        },
-      ]);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+
+          if (event.type === "chunk") {
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.id === assistantId
+                  ? { ...message, content: `${message.content}${event.content}` }
+                  : message,
+              ),
+            );
+          }
+
+          if (event.type === "final") {
+            const data = event.data;
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.id === assistantId
+                  ? {
+                      ...message,
+                      content: data.answer,
+                      matches: data.matches,
+                      confidence: data.confidence,
+                      citations: data.citations || [],
+                    }
+                  : message,
+              ),
+            );
+          }
+
+          if (event.type === "error") {
+            throw new Error(event.detail || "Streaming error");
+          }
+        }
+      }
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          role: "assistant",
-          content: "Sorry, I am having trouble connecting to the Vozhi Orchestrator right now.",
-        },
-      ]);
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === assistantId
+            ? {
+                ...message,
+                content: "Sorry, I am having trouble connecting to the Vozhi Orchestrator right now.",
+              }
+            : message,
+        ),
+      );
     } finally {
       setLoading(false);
       setUploadedDoc(null);
