@@ -10,10 +10,12 @@ import {
   Image as ImageIcon,
   Loader2,
   MessageSquare,
+  Mic,
   Moon,
   Paperclip,
   Share2,
   ShieldCheck,
+  Square,
   Sun,
   Trash2,
 } from "lucide-react";
@@ -60,7 +62,11 @@ export default function VozhiApp() {
   const [activeTab, setActiveTab] = useState<"home" | "chat">("home");
   const [uploadedDoc, setUploadedDoc] = useState<File | null>(null);
   const [showWhatsApp, setShowWhatsApp] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
   const createNewSession = useCallback(async (currentHistory: ChatSession[]) => {
     const newSessionId = `web-${Math.random().toString(36).substring(7)}`;
@@ -101,32 +107,15 @@ export default function VozhiApp() {
 
         const loadedHistory: ChatSession[] = await res.json();
         setHistory(loadedHistory);
-
-        if (loadedHistory.length > 0) {
-          const active = loadedHistory[0];
-          setSession(active.id);
-          setActiveTab("chat");
-
-          const msgRes = await fetch(`http://127.0.0.1:8000/api/sessions/${active.id}`);
-          if (msgRes.ok) {
-            const data = await msgRes.json();
-            setMessages(data.messages);
-          }
-        } else {
-          setActiveTab("home");
-          setSession("");
-          setMessages([]);
-        }
+        await createNewSession(loadedHistory);
       } catch (e) {
         console.error("Failed to load history from DB", e);
-        setActiveTab("home");
-        setSession("");
-        setMessages([]);
+        await createNewSession([]);
       }
     }
 
     void loadData();
-  }, []);
+  }, [createNewSession]);
 
   useEffect(() => {
     const storedTheme = window.localStorage.getItem("vozhi-theme");
@@ -170,6 +159,13 @@ export default function VozhiApp() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      mediaRecorderRef.current?.stop();
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
 
   const startNewChat = async () => {
     await createNewSession(history);
@@ -220,34 +216,32 @@ export default function VozhiApp() {
     }
   };
 
-  const handleSend = async () => {
-    if (!input.trim() && !uploadedDoc) return;
+  const streamChatResponse = async (
+    request: RequestInit,
+    userMessageContent: string,
+    options?: { replaceUserMessageWithTranscript?: boolean },
+  ) => {
     if (!session) return;
 
-    const userMsg: Message = {
-      id: Date.now().toString(),
-      role: "user",
-      content: input || `(Uploaded Document: ${uploadedDoc?.name})`,
-    };
-    setMessages((prev) => [...prev, userMsg]);
-    setInput("");
-    setLoading(true);
-    const assistantId = `${Date.now()}-assistant`;
+    const userId = Date.now().toString();
+    const assistantId = `${userId}-assistant`;
     setMessages((prev) => [
       ...prev,
+      {
+        id: userId,
+        role: "user",
+        content: userMessageContent,
+      },
       {
         id: assistantId,
         role: "assistant",
         content: "",
       },
     ]);
+    setLoading(true);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/chat/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: userMsg.content, session_id: session }),
-      });
+      const res = await fetch("http://127.0.0.1:8000/chat/stream", request);
       if (!res.ok) throw new Error("API Error");
       if (!res.body) throw new Error("Streaming body unavailable");
 
@@ -267,6 +261,19 @@ export default function VozhiApp() {
           if (!line.trim()) continue;
           const event = JSON.parse(line);
 
+          if (event.type === "transcript" && options?.replaceUserMessageWithTranscript) {
+            setMessages((prev) =>
+              prev.map((message) =>
+                message.id === userId
+                  ? {
+                      ...message,
+                      content: event.content || "Voice note",
+                    }
+                  : message,
+              ),
+            );
+          }
+
           if (event.type === "chunk") {
             setMessages((prev) =>
               prev.map((message) =>
@@ -280,17 +287,21 @@ export default function VozhiApp() {
           if (event.type === "final") {
             const data = event.data;
             setMessages((prev) =>
-              prev.map((message) =>
-                message.id === assistantId
-                  ? {
-                      ...message,
-                      content: data.answer,
-                      matches: data.matches,
-                      confidence: data.confidence,
-                      citations: data.citations || [],
-                    }
-                  : message,
-              ),
+              prev.map((message) => {
+                if (message.id === userId && data.transcribed_text && options?.replaceUserMessageWithTranscript) {
+                  return { ...message, content: data.transcribed_text };
+                }
+                if (message.id === assistantId) {
+                  return {
+                    ...message,
+                    content: data.answer,
+                    matches: data.matches,
+                    confidence: data.confidence,
+                    citations: data.citations || [],
+                  };
+                }
+                return message;
+              }),
             );
           }
 
@@ -313,6 +324,102 @@ export default function VozhiApp() {
     } finally {
       setLoading(false);
       setUploadedDoc(null);
+    }
+  };
+
+  const handleSend = async () => {
+    if (!input.trim() && !uploadedDoc) return;
+    if (!session) return;
+
+    const trimmedInput = input.trim();
+    setInput("");
+
+    if (uploadedDoc) {
+      const formData = new FormData();
+      formData.append("session_id", session);
+      formData.append("query", trimmedInput);
+      formData.append("file", uploadedDoc);
+      await streamChatResponse(
+        {
+          method: "POST",
+          body: formData,
+        },
+        trimmedInput || `(Uploaded Document: ${uploadedDoc.name})`,
+      );
+      return;
+    }
+
+    await streamChatResponse(
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: trimmedInput, session_id: session }),
+      },
+      trimmedInput,
+    );
+  };
+
+  const handleToggleRecording = async () => {
+    if (loading || !session) return;
+
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      setIsRecording(false);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      audioChunksRef.current = [];
+
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm")
+        ? "audio/webm"
+        : "audio/mp4";
+      const recorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        const extension = recorder.mimeType.includes("mp4") ? "m4a" : "webm";
+        const audioFile = new File([audioBlob], `voice-note.${extension}`, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+        audioChunksRef.current = [];
+
+        const formData = new FormData();
+        formData.append("session_id", session);
+        formData.append("file", audioFile);
+        void streamChatResponse(
+          {
+            method: "POST",
+            body: formData,
+          },
+          "Transcribing your voice note...",
+          { replaceUserMessageWithTranscript: true },
+        );
+      };
+
+      recorder.start();
+      setIsRecording(true);
+    } catch {
+      setIsRecording(false);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-assistant-error`,
+          role: "assistant",
+          content: "Microphone access failed. Please allow mic access and try again, or send the query as text.",
+        },
+      ]);
     }
   };
 
@@ -584,6 +691,7 @@ export default function VozhiApp() {
                       variant="ghost"
                       size="icon"
                       className="relative h-8 w-8 rounded-full text-zinc-400 hover:bg-zinc-100 hover:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+                      disabled={loading || isRecording}
                     >
                       <input
                         type="file"
@@ -603,10 +711,23 @@ export default function VozhiApp() {
                     rows={1}
                   />
 
-                  <div className="flex shrink-0 pb-1 pr-1">
+                  <div className="flex shrink-0 items-center gap-2 pb-1 pr-1">
+                    <Button
+                      onClick={() => void handleToggleRecording()}
+                      disabled={loading || !session}
+                      size="icon"
+                      variant="ghost"
+                      className={`h-8 w-8 rounded-full transition-all ${
+                        isRecording
+                          ? "bg-red-100 text-red-600 hover:bg-red-200 dark:bg-red-950 dark:text-red-300 dark:hover:bg-red-900"
+                          : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                      }`}
+                    >
+                      {isRecording ? <Square className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+                    </Button>
                     <Button
                       onClick={() => void handleSend()}
-                      disabled={loading || !session || (!input.trim() && !uploadedDoc)}
+                      disabled={loading || isRecording || !session || (!input.trim() && !uploadedDoc)}
                       size="icon"
                       className="h-8 w-8 rounded-full bg-zinc-600 text-white transition-all hover:bg-zinc-800 disabled:opacity-30 disabled:hover:bg-zinc-600 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
                     >
