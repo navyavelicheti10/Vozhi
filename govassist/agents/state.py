@@ -15,6 +15,7 @@ class AgentState(TypedDict, total=False):
     raw_query: Optional[str]
     current_query: str
     uploaded_file_path: Optional[str]
+    route: str
 
     # Agent outputs
     user_profile: Dict[str, Any]
@@ -28,3 +29,4 @@ class AgentState(TypedDict, total=False):
     final_package: str
     confidence_score: float
     citations: List[str]
+    sources: List[Dict[str, str]]

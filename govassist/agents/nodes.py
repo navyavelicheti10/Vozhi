@@ -24,8 +24,32 @@ ocr_reader = None
 
 GREETING_PATTERNS = (
     re.compile(r"^\s*(hi|hii+|hello|hey|heyy+|namaste|namaskaram|good (morning|afternoon|evening))[\s!.?]*$", re.I),
-    re.compile(r"^\s*(bye|goodbye|see you|thanks|thank you|ok thanks|okay thanks|thx)[\s!.?]*$", re.I),
+    re.compile(r"^\s*(bye+|goodbye|see you|thanks+|thank you|ok thanks|okay thanks|thx)[\s!.?]*$", re.I),
 )
+SCHEME_KEYWORDS = {
+    "scheme",
+    "schemes",
+    "yojana",
+    "subsidy",
+    "benefit",
+    "benefits",
+    "eligibility",
+    "eligible",
+    "apply",
+    "application",
+    "loan",
+    "scholarship",
+    "pension",
+    "grant",
+    "farmer",
+    "student",
+    "women",
+    "widow",
+    "disabled",
+    "startup",
+    "housing",
+    "government",
+}
 
 
 def _is_small_talk(query: str) -> bool:
@@ -38,10 +62,69 @@ def _is_small_talk(query: str) -> bool:
 def _build_small_talk_response(query: str) -> str:
     normalized = clean_text(query or "").strip().lower()
     if any(token in normalized for token in ("bye", "goodbye", "see you")):
-        return "Goodbye. Reach out anytime if you want help finding the right government scheme."
+        return "Bye. Reach out anytime if you want help finding the right government scheme."
     if any(token in normalized for token in ("thanks", "thank you", "thx")):
         return "You’re welcome. If you want, I can help you check eligibility or find a scheme by state, profession, or benefit type."
+    if "your name" in normalized or "who are you" in normalized:
+        return "I’m Vozhi. I can chat naturally, help you understand documents, and look up relevant government schemes only when your question needs that."
+    if "what can you do" in normalized or "help me" in normalized:
+        return (
+            "I can chat with you normally, answer quick questions about the assistant, "
+            "and help find government schemes when you share your state, profile, or goal."
+        )
     return "Hello. I can help you find relevant government schemes, check eligibility, or review uploaded documents."
+
+
+def _is_assistant_meta_query(query: str) -> bool:
+    normalized = clean_text(query or "").strip().lower()
+    if not normalized:
+        return False
+
+    assistant_phrases = (
+        "who are you",
+        "what is your name",
+        "your name",
+        "what can you do",
+        "help me",
+        "how can you help",
+        "can you help",
+        "what do you do",
+    )
+    return any(phrase in normalized for phrase in assistant_phrases)
+
+
+def _build_out_of_scope_response() -> str:
+    return (
+        "I’m mainly here to help with government schemes, eligibility, documents, and application guidance. "
+        "If you want, tell me your state and what kind of benefit you need, and I’ll help with that."
+    )
+
+
+def _looks_like_scheme_query(query: str) -> bool:
+    normalized = clean_text(query or "").lower()
+    if not normalized:
+        return False
+    if _is_small_talk(normalized):
+        return False
+    return any(keyword in normalized for keyword in SCHEME_KEYWORDS)
+
+
+def _build_sources(schemes: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    sources: List[Dict[str, str]] = []
+
+    for scheme in schemes:
+        name = clean_text(scheme.get("scheme_name", ""))
+        url = clean_text(scheme.get("official_link") or scheme.get("source", ""))
+        if not name or not url:
+            continue
+        key = (name, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append({"title": name, "url": url})
+
+    return sources
 
 
 def _safe_json_loads(payload: str) -> Dict[str, Any]:
@@ -62,22 +145,33 @@ def _safe_json_loads(payload: str) -> Dict[str, Any]:
         return {}
 
 
-def _get_or_init_clients() -> None:
-    global llm, embedding_service, qdrant, graph_manager
+def _ensure_llm() -> None:
+    global llm
 
     if llm is not None:
         return
 
     load_env_file()
     llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.2)
-    embedding_service = EmbeddingService(model_name="BAAI/bge-small-en-v1.5")
-    qdrant = QdrantManager(collection_name="schemes")
-    graph_manager = GraphStoreManager()
 
-    try:
-        graph_manager.load_or_create()
-    except Exception as exc:
-        logger.warning("Graph store could not be loaded. Synergy retrieval will be skipped: %s", exc)
+
+def _ensure_rag_clients() -> None:
+    global embedding_service, qdrant, graph_manager
+
+    _ensure_llm()
+
+    if embedding_service is None:
+        embedding_service = EmbeddingService(model_name="BAAI/bge-small-en-v1.5")
+
+    if qdrant is None:
+        qdrant = QdrantManager(collection_name="schemes")
+
+    if graph_manager is None:
+        graph_manager = GraphStoreManager()
+        try:
+            graph_manager.load_or_create()
+        except Exception as exc:
+            logger.warning("Graph store could not be loaded. Synergy retrieval will be skipped: %s", exc)
 
 
 def _get_or_init_ocr_reader():
@@ -166,18 +260,20 @@ def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMes
     ]
 
     system_prompt = (
-        "You are GovAssist, a precise assistant for Indian government schemes.\n"
+        "You are Vozhi, a helpful and natural conversational assistant for Indian government schemes.\n"
         "Answer using only the supplied retrieval context. Do not invent or assume missing facts.\n"
-        "Keep the response tight, readable, and decision-oriented.\n\n"
-        "Formatting rules:\n"
-        "- Use short Markdown sections with these headings when relevant: Best Match, Eligibility, Benefits, Documents Required, How to Apply, Also Consider, Next Step.\n"
-        "- Start with one sentence that directly answers the user.\n"
-        "- Focus on the single best-fit scheme first.\n"
-        "- Mention synergy schemes only if they are genuinely relevant and label them under Also Consider.\n"
-        "- Use plain language and short bullets under sections when useful.\n"
-        "- Add inline citations in this exact format: [Source: Scheme Name].\n"
-        "- If retrieval is weak or partial, say so briefly instead of filling gaps.\n"
-        "- Do not output JSON."
+        "Sound human, calm, and practical. Do not sound like a report unless the user explicitly asks for a structured summary.\n\n"
+        "Response rules:\n"
+        "- First understand the user's intent. If they are greeting, clarifying, or asking casually, respond naturally.\n"
+        "- Only discuss scheme details that are relevant to the user's question.\n"
+        "- Do not force headings like Best Match or Next Step unless they truly help.\n"
+        "- If the user gave too little information, ask only one short follow-up question.\n"
+        "- If retrieval is weak or partial, say that briefly instead of filling gaps.\n"
+        "- When naming a scheme, explain why it matches in plain language.\n"
+        "- If multiple schemes are relevant, mention at most 2 or 3.\n"
+        "- Do not mention confidence scores, retrieval scores, or internal orchestration.\n"
+        "- Do not output JSON.\n"
+        "- Do not include raw URLs in the body. The UI will render sources separately."
     )
     human_prompt = (
         f"User query: {current_query}\n"
@@ -193,7 +289,7 @@ def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMes
 
 
 def build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMessage]:
-    _get_or_init_clients()
+    _ensure_llm()
     return _build_post_rag_messages(state)
 
 
@@ -206,12 +302,13 @@ def build_post_rag_metadata(state: AgentState) -> Dict[str, Any]:
     ]
     return {
         "citations": citations,
+        "sources": _build_sources(schemes),
         "confidence_score": _calculate_confidence(schemes),
     }
 
 
 def _post_rag_response(state: AgentState) -> Dict[str, Any]:
-    _get_or_init_clients()
+    _ensure_llm()
 
     schemes = state.get("retrieved_schemes", [])
     synergies = state.get("synergy_schemes", [])
@@ -229,6 +326,7 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
             "final_package": fallback,
             "confidence_score": 0.25,
             "citations": [],
+            "sources": [],
             "messages": [AIMessage(content=fallback)],
         }
 
@@ -244,12 +342,65 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
         "final_package": response.content.strip(),
         "confidence_score": normalized_confidence,
         "citations": citations,
+        "sources": _build_sources(schemes),
         "messages": [AIMessage(content=response.content.strip())],
     }
 
 
+def main_agent(state: AgentState) -> Dict[str, Any]:
+    """Primary router that decides whether to answer directly or run RAG."""
+    _ensure_llm()
+
+    seed_query = clean_text(
+        state.get("raw_query", "") or state.get("transcribed_text", "") or state.get("current_query", "")
+    )
+    if not seed_query:
+        reply = "Tell me what you need, and I’ll help. If you're looking for a government scheme, share your state or purpose."
+        return {
+            "route": "respond",
+            "current_query": "",
+            "final_package": reply,
+            "confidence_score": 1.0,
+            "citations": [],
+            "sources": [],
+            "rag_completed": True,
+            "messages": [AIMessage(content=reply)],
+        }
+
+    if _is_small_talk(seed_query):
+        reply = _build_small_talk_response(seed_query)
+        return {
+            "route": "respond",
+            "current_query": seed_query,
+            "final_package": reply,
+            "confidence_score": 1.0,
+            "citations": [],
+            "sources": [],
+            "rag_completed": True,
+            "messages": [AIMessage(content=reply)],
+        }
+
+    if _is_assistant_meta_query(seed_query):
+        return {"route": "respond"}
+
+    if _looks_like_scheme_query(seed_query):
+        return {"route": "retrieve"}
+
+    reply = _build_out_of_scope_response()
+    return {
+        "route": "respond",
+        "current_query": seed_query,
+        "final_package": reply,
+        "confidence_score": 1.0,
+        "citations": [],
+        "sources": [],
+        "rag_completed": True,
+        "messages": [AIMessage(content=reply)],
+    }
+
+
 def _pre_rag_query_refinement(state: AgentState) -> Dict[str, Any]:
-    _get_or_init_clients()
+    _ensure_llm()
 
     raw_query = clean_text(state.get("raw_query", ""))
     transcribed_text = clean_text(state.get("transcribed_text", ""))
@@ -295,6 +446,20 @@ def llm_agent(state: AgentState) -> Dict[str, Any]:
             "final_package": reply,
             "confidence_score": 1.0,
             "citations": [],
+            "sources": [],
+            "rag_completed": True,
+            "messages": [AIMessage(content=reply)],
+        }
+
+    if state.get("route") == "respond":
+        logger.info("Answering directly without RAG for query: %s", seed_query)
+        reply = _build_small_talk_response(seed_query) if _is_assistant_meta_query(seed_query) else _build_out_of_scope_response()
+        return {
+            "current_query": seed_query,
+            "final_package": reply,
+            "confidence_score": 0.9,
+            "citations": [],
+            "sources": [],
             "rag_completed": True,
             "messages": [AIMessage(content=reply)],
         }
@@ -305,7 +470,7 @@ def llm_agent(state: AgentState) -> Dict[str, Any]:
 
 def document_agent(state: AgentState) -> Dict[str, Any]:
     """Extract text and basic structured fields from uploaded image/PDF documents."""
-    _get_or_init_clients()
+    _ensure_llm()
     file_path_value = state.get("uploaded_file_path")
     if not file_path_value:
         return {"documents_extracted": {}}
@@ -358,7 +523,7 @@ def document_agent(state: AgentState) -> Dict[str, Any]:
 
 def rag_agent(state: AgentState) -> Dict[str, Any]:
     """Hybrid semantic retrieval with optional graph-based synergy lookup."""
-    _get_or_init_clients()
+    _ensure_rag_clients()
 
     query = clean_text(state.get("current_query", ""))
     if not query:

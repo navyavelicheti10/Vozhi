@@ -1,14 +1,24 @@
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from govassist.agents.nodes import document_agent, llm_agent, rag_agent
+from govassist.agents.nodes import document_agent, llm_agent, main_agent, rag_agent
 from govassist.agents.state import AgentState
 
 
 def route_from_start(state: AgentState) -> str:
     if state.get("input_type") == "document":
         return "DocumentAgent"
-    return "LLMAgent"
+    return "MainAgent"
+
+
+def route_after_document(_: AgentState) -> str:
+    return "MainAgent"
+
+
+def route_after_main(state: AgentState) -> str:
+    if state.get("route") == "respond":
+        return "LLMAgent"
+    return "RAGAgent"
 
 
 def route_after_llm(state: AgentState) -> str:
@@ -20,12 +30,14 @@ def route_after_llm(state: AgentState) -> str:
 def build_graph():
     builder = StateGraph(AgentState)
 
+    builder.add_node("MainAgent", main_agent)
     builder.add_node("LLMAgent", llm_agent)
     builder.add_node("RAGAgent", rag_agent)
     builder.add_node("DocumentAgent", document_agent)
 
     builder.add_conditional_edges(START, route_from_start)
-    builder.add_edge("DocumentAgent", "LLMAgent")
+    builder.add_conditional_edges("DocumentAgent", route_after_document)
+    builder.add_conditional_edges("MainAgent", route_after_main)
     builder.add_conditional_edges("LLMAgent", route_after_llm)
     builder.add_edge("RAGAgent", "LLMAgent")
 

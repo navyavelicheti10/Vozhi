@@ -101,10 +101,12 @@ def _build_state(
         "documents_extracted": {},
         "retrieved_schemes": [],
         "synergy_schemes": [],
+        "route": "",
         "rag_completed": False,
         "final_package": "",
         "confidence_score": 0.0,
         "citations": [],
+        "sources": [],
     }
 
 
@@ -121,6 +123,7 @@ def _format_chat_response(session_id: str, state: dict[str, Any]) -> dict[str, A
         "synergy_schemes": state.get("synergy_schemes", []),
         "documents_extracted": state.get("documents_extracted", {}),
         "citations": state.get("citations", []),
+        "sources": state.get("sources", []),
     }
 
 
@@ -272,7 +275,15 @@ async def chat_stream(request: Request):
 
     async def event_stream():
         try:
-            llm_state = _merge_state(state, agent_nodes.llm_agent(state))
+            routed_state = _merge_state(state, agent_nodes.main_agent(state))
+
+            if routed_state.get("rag_completed") and routed_state.get("final_package"):
+                final_payload = _format_chat_response(session_id, routed_state)
+                yield json.dumps({"type": "chunk", "content": final_payload["answer"]}) + "\n"
+                yield json.dumps({"type": "final", "data": final_payload}) + "\n"
+                return
+
+            llm_state = _merge_state(routed_state, agent_nodes.llm_agent(routed_state))
 
             if llm_state.get("rag_completed") and llm_state.get("final_package"):
                 final_payload = _format_chat_response(session_id, llm_state)
@@ -281,7 +292,7 @@ async def chat_stream(request: Request):
                 return
 
             rag_state = _merge_state(llm_state, agent_nodes.rag_agent(llm_state))
-            agent_nodes._get_or_init_clients()
+            agent_nodes._ensure_llm()
             if agent_nodes.llm is None:
                 raise RuntimeError("LLM client could not be initialized for streaming.")
 
@@ -310,6 +321,7 @@ async def chat_stream(request: Request):
                 {
                     "final_package": final_text,
                     "citations": metadata["citations"],
+                    "sources": metadata["sources"],
                     "confidence_score": metadata["confidence_score"],
                 },
             )

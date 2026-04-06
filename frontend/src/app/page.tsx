@@ -33,6 +33,11 @@ interface SchemeMatch {
   scheme_name?: string;
 }
 
+interface SourceLink {
+  title: string;
+  url: string;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
@@ -40,6 +45,7 @@ interface Message {
   matches?: SchemeMatch[];
   citations?: string[];
   confidence?: number;
+  sources?: SourceLink[];
 }
 
 interface ChatSession {
@@ -298,6 +304,7 @@ export default function VozhiApp() {
                     matches: data.matches,
                     confidence: data.confidence,
                     citations: data.citations || [],
+                    sources: data.sources || [],
                   };
                 }
                 return message;
@@ -620,7 +627,7 @@ export default function VozhiApp() {
                               <span className="mx-1 text-zinc-300 dark:text-zinc-700">|</span>
                               <span className="flex items-center gap-1.5 font-mono text-[11px] tracking-tight text-green-600">
                                 <ShieldCheck className="h-3.5 w-3.5" /> Faithfulness:{" "}
-                                {message.confidence.toFixed(1)}%
+                                {(message.confidence * 100).toFixed(1)}%
                               </span>
                             </>
                           )}
@@ -628,16 +635,21 @@ export default function VozhiApp() {
                         <div className="prose prose-sm ml-6 max-w-none whitespace-pre-wrap font-sans leading-relaxed text-zinc-800 dark:text-zinc-100">
                           {message.content}
                         </div>
-                        {message.citations && message.citations.length > 0 && (
-                          <div className="ml-6 mt-4 space-y-1.5">
-                            {message.citations.slice(0, 3).map((cite, index) => (
-                              <div
-                                key={index}
-                                className="flex max-w-fit items-start gap-2 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs text-zinc-600 shadow-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+                        {message.sources && message.sources.length > 0 && (
+                          <div className="ml-6 mt-4 space-y-2">
+                            <p className="text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+                              Official Links
+                            </p>
+                            {message.sources.slice(0, 3).map((source, index) => (
+                              <a
+                                key={`${source.url}-${index}`}
+                                href={source.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="block max-w-fit rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-700 transition hover:bg-blue-100 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300 dark:hover:bg-blue-950/70"
                               >
-                                <span className="font-mono text-zinc-400">[{index + 1}]</span>{" "}
-                                {cite}
-                              </div>
+                                {index + 1}. {source.title}
+                              </a>
                             ))}
                           </div>
                         )}
@@ -657,7 +669,7 @@ export default function VozhiApp() {
                     <div className="flex w-full flex-col">
                       <div className="mb-2 flex items-center gap-2 text-[13px] font-medium text-zinc-500 dark:text-zinc-400">
                         <Bot className="h-4 w-4 animate-pulse text-zinc-600 dark:text-zinc-300" />
-                        <span>Executing LangGraph nodes...</span>
+                        <span>Vozhi is thinking...</span>
                       </div>
                       <div className="ml-6 py-2">
                         <Loader2 className="h-5 w-5 animate-spin text-zinc-300 dark:text-zinc-600" />
