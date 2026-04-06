@@ -1,3 +1,9 @@
+"""Legacy Groq wrapper used by the older non-LangGraph pipeline.
+
+The active backend now synthesizes answers through `govassist/agents/nodes.py`.
+This module remains in the repo as reference code.
+"""
+
 import logging
 import os
 from typing import Dict, List

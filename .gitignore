@@ -1,9 +1,51 @@
+# Environment and local machine config
 .env
-.venv/
+.env.*
+!.env.example
+.python-version
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local data stores and runtime artifacts
 checkpoints/
 qdrant_data/
 tmp_qdrant_test/
-.vscode/
+temp_uploads/
+*.db
+*.sqlite
+*.sqlite3
 
+# Frontend build and dependencies
+frontend/.next/
+frontend/node_modules/
+frontend/out/
+frontend/.turbo/
+
+# Logs and temp files
+*.log
+*.pid
+*.seed
+*.out
+*.err
+.DS_Store
+Thumbs.db
+
+# Editors and tooling
+.vscode/
+.idea/
+.codex/

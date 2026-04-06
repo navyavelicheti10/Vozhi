@@ -10,6 +10,7 @@ from langchain_groq import ChatGroq
 from govassist.agents.state import AgentState
 from govassist.api.db_utils import search_schemes_in_db
 from govassist.config import load_env_file
+from govassist.integrations.sarvam import sarvam_client
 from govassist.rag.embeddings import EmbeddingService, clean_text
 from govassist.rag.graph_store import GraphStoreManager
 from govassist.rag.vector_store import QdrantManager
@@ -26,6 +27,21 @@ GREETING_PATTERNS = (
     re.compile(r"^\s*(hi|hii+|hello|hey|heyy+|namaste|namaskaram|good (morning|afternoon|evening))[\s!.?]*$", re.I),
     re.compile(r"^\s*(bye+|goodbye|see you|thanks+|thank you|ok thanks|okay thanks|thx)[\s!.?]*$", re.I),
 )
+
+LANGUAGE_LABELS = {
+    "en-IN": "English",
+    "hi-IN": "Hindi",
+    "bn-IN": "Bengali",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+    "kn-IN": "Kannada",
+    "ml-IN": "Malayalam",
+    "mr-IN": "Marathi",
+    "gu-IN": "Gujarati",
+    "pa-IN": "Punjabi",
+    "od-IN": "Odia",
+}
+
 SCHEME_KEYWORDS = {
     "scheme",
     "schemes",
@@ -73,6 +89,19 @@ def _build_small_talk_response(query: str) -> str:
             "and help find government schemes when you share your state, profile, or goal."
         )
     return "Hello. I can help you find relevant government schemes, check eligibility, or review uploaded documents."
+
+
+def _localize_text(text: str, state: AgentState) -> str:
+    target_language = state.get("response_language_code", "en-IN")
+    if not text or target_language == "en-IN":
+        return text
+
+    translated = sarvam_client.translate_text(
+        text=text,
+        source_language_code="en-IN",
+        target_language_code=target_language,
+    )
+    return translated.get("translated_text", text).strip() or text
 
 
 def _is_assistant_meta_query(query: str) -> bool:
@@ -243,6 +272,8 @@ def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMes
     documents_extracted = state.get("documents_extracted", {})
     user_profile = state.get("user_profile", {})
     current_query = state.get("current_query", "")
+    response_language_code = state.get("response_language_code", "en-IN")
+    response_language = LANGUAGE_LABELS.get(response_language_code, "English")
 
     trimmed_schemes = [
         {
@@ -262,18 +293,17 @@ def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMes
     system_prompt = (
         "You are Vozhi, a helpful and natural conversational assistant for Indian government schemes.\n"
         "Answer using only the supplied retrieval context. Do not invent or assume missing facts.\n"
-        "Sound human, calm, and practical. Do not sound like a report unless the user explicitly asks for a structured summary.\n\n"
-        "Response rules:\n"
-        "- First understand the user's intent. If they are greeting, clarifying, or asking casually, respond naturally.\n"
-        "- Only discuss scheme details that are relevant to the user's question.\n"
-        "- Do not force headings like Best Match or Next Step unless they truly help.\n"
-        "- If the user gave too little information, ask only one short follow-up question.\n"
-        "- If retrieval is weak or partial, say that briefly instead of filling gaps.\n"
-        "- When naming a scheme, explain why it matches in plain language.\n"
-        "- If multiple schemes are relevant, mention at most 2 or 3.\n"
-        "- Do not mention confidence scores, retrieval scores, or internal orchestration.\n"
+        "Keep the response tight, readable, and decision-oriented.\n\n"
+        "Formatting rules:\n"
+        "- Use short Markdown sections with these headings when relevant: Best Match, Eligibility, Benefits, Documents Required, How to Apply, Also Consider, Next Step.\n"
+        "- Start with one sentence that directly answers the user.\n"
+        "- Focus on the single best-fit scheme first.\n"
+        "- Mention synergy schemes only if they are genuinely relevant and label them under Also Consider.\n"
+        "- Use plain language and short bullets under sections when useful.\n"
+        "- Add inline citations in this exact format: [Source: Scheme Name].\n"
+        "- If retrieval is weak or partial, say so briefly instead of filling gaps.\n"
         "- Do not output JSON.\n"
-        "- Do not include raw URLs in the body. The UI will render sources separately."
+        f"- Write the final answer entirely in {response_language}."
     )
     human_prompt = (
         f"User query: {current_query}\n"
@@ -311,10 +341,6 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
     _ensure_llm()
 
     schemes = state.get("retrieved_schemes", [])
-    synergies = state.get("synergy_schemes", [])
-    documents_extracted = state.get("documents_extracted", {})
-    user_profile = state.get("user_profile", {})
-    current_query = state.get("current_query", "")
 
     if not schemes:
         fallback = (
@@ -322,6 +348,7 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
             "Please try a more specific query such as your state, profession, income bracket, or target benefit. "
             "If you uploaded a document, I can also use a clearer scan or an extra text hint about what you want to check."
         )
+        fallback = _localize_text(fallback, state)
         return {
             "final_package": fallback,
             "confidence_score": 0.25,
@@ -336,11 +363,10 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
         for scheme in schemes
         if clean_text(scheme.get("scheme_name"))
     ]
-    normalized_confidence = _calculate_confidence(schemes)
 
     return {
         "final_package": response.content.strip(),
-        "confidence_score": normalized_confidence,
+        "confidence_score": _calculate_confidence(schemes),
         "citations": citations,
         "sources": _build_sources(schemes),
         "messages": [AIMessage(content=response.content.strip())],
@@ -355,7 +381,10 @@ def main_agent(state: AgentState) -> Dict[str, Any]:
         state.get("raw_query", "") or state.get("transcribed_text", "") or state.get("current_query", "")
     )
     if not seed_query:
-        reply = "Tell me what you need, and I’ll help. If you're looking for a government scheme, share your state or purpose."
+        reply = _localize_text(
+            "Tell me what you need, and I’ll help. If you're looking for a government scheme, share your state or purpose.",
+            state,
+        )
         return {
             "route": "respond",
             "current_query": "",
@@ -368,7 +397,7 @@ def main_agent(state: AgentState) -> Dict[str, Any]:
         }
 
     if _is_small_talk(seed_query):
-        reply = _build_small_talk_response(seed_query)
+        reply = _localize_text(_build_small_talk_response(seed_query), state)
         return {
             "route": "respond",
             "current_query": seed_query,
@@ -386,7 +415,7 @@ def main_agent(state: AgentState) -> Dict[str, Any]:
     if _looks_like_scheme_query(seed_query):
         return {"route": "retrieve"}
 
-    reply = _build_out_of_scope_response()
+    reply = _localize_text(_build_out_of_scope_response(), state)
     return {
         "route": "respond",
         "current_query": seed_query,
@@ -407,7 +436,7 @@ def _pre_rag_query_refinement(state: AgentState) -> Dict[str, Any]:
     current_query = clean_text(state.get("current_query", ""))
     document_context = _build_document_context(state)
 
-    seed_query = raw_query or transcribed_text or current_query or document_context
+    seed_query = current_query or raw_query or transcribed_text or document_context
     if not seed_query:
         seed_query = "Find relevant government schemes using the uploaded document details."
 
@@ -438,22 +467,14 @@ def llm_agent(state: AgentState) -> Dict[str, Any]:
     seed_query = clean_text(
         state.get("raw_query", "") or state.get("transcribed_text", "") or state.get("current_query", "")
     )
-    if _is_small_talk(seed_query):
-        logger.info("Short-circuiting small-talk query without RAG: %s", seed_query)
-        reply = _build_small_talk_response(seed_query)
-        return {
-            "current_query": seed_query,
-            "final_package": reply,
-            "confidence_score": 1.0,
-            "citations": [],
-            "sources": [],
-            "rag_completed": True,
-            "messages": [AIMessage(content=reply)],
-        }
-
     if state.get("route") == "respond":
         logger.info("Answering directly without RAG for query: %s", seed_query)
-        reply = _build_small_talk_response(seed_query) if _is_assistant_meta_query(seed_query) else _build_out_of_scope_response()
+        reply = (
+            _build_small_talk_response(seed_query)
+            if (_is_small_talk(seed_query) or _is_assistant_meta_query(seed_query))
+            else _build_out_of_scope_response()
+        )
+        reply = _localize_text(reply, state)
         return {
             "current_query": seed_query,
             "final_package": reply,
@@ -488,10 +509,7 @@ def document_agent(state: AgentState) -> Dict[str, Any]:
         }
 
     suffix = file_path.suffix.lower()
-    if suffix == ".pdf":
-        extracted_text = _extract_pdf_text(file_path)
-    else:
-        extracted_text = _extract_image_text(file_path)
+    extracted_text = _extract_pdf_text(file_path) if suffix == ".pdf" else _extract_image_text(file_path)
 
     structured_fields: Dict[str, Any] = {}
     if extracted_text:

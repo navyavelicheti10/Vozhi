@@ -11,6 +11,7 @@ This is the active GovAssist web UI built with Next.js.
   - text chat
   - document upload
   - in-browser microphone recording for speech-to-text chat
+  - click-to-listen playback for assistant responses via `POST /tts`
 
 ## Development
 

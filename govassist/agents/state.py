@@ -15,11 +15,13 @@ class AgentState(TypedDict, total=False):
     raw_query: Optional[str]
     current_query: str
     uploaded_file_path: Optional[str]
-    route: str
+    query_language_code: str
+    response_language_code: str
 
     # Agent outputs
     user_profile: Dict[str, Any]
     documents_extracted: Dict[str, Any]
+    route: str
     # RAG retrievals
     retrieved_schemes: List[Dict[str, Any]]
     synergy_schemes: List[Dict[str, Any]]

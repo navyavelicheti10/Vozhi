@@ -1,3 +1,10 @@
+"""Legacy reference pipeline.
+
+The active runtime path uses FastAPI + LangGraph under `govassist/api/api.py`
+and `govassist/agents/*`. This module is kept for reference and is not wired
+into the current application flow.
+"""
+
 import logging
 import os
 import re

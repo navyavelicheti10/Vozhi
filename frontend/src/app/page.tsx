@@ -18,6 +18,7 @@ import {
   Square,
   Sun,
   Trash2,
+  Volume2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -46,6 +47,7 @@ interface Message {
   citations?: string[];
   confidence?: number;
   sources?: SourceLink[];
+  responseLanguageCode?: string;
 }
 
 interface ChatSession {
@@ -69,10 +71,14 @@ export default function VozhiApp() {
   const [uploadedDoc, setUploadedDoc] = useState<File | null>(null);
   const [showWhatsApp, setShowWhatsApp] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [audioLoadingId, setAudioLoadingId] = useState<string | null>(null);
+  const [playingMessageId, setPlayingMessageId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const playbackAudioRef = useRef<HTMLAudioElement | null>(null);
+  const playbackUrlRef = useRef<string | null>(null);
 
   const createNewSession = useCallback(async (currentHistory: ChatSession[]) => {
     const newSessionId = `web-${Math.random().toString(36).substring(7)}`;
@@ -170,8 +176,22 @@ export default function VozhiApp() {
     return () => {
       mediaRecorderRef.current?.stop();
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      playbackAudioRef.current?.pause();
+      if (playbackUrlRef.current) {
+        URL.revokeObjectURL(playbackUrlRef.current);
+      }
     };
   }, []);
+
+  const cleanupPlayback = () => {
+    playbackAudioRef.current?.pause();
+    playbackAudioRef.current = null;
+    if (playbackUrlRef.current) {
+      URL.revokeObjectURL(playbackUrlRef.current);
+      playbackUrlRef.current = null;
+    }
+    setPlayingMessageId(null);
+  };
 
   const startNewChat = async () => {
     await createNewSession(history);
@@ -305,6 +325,7 @@ export default function VozhiApp() {
                     confidence: data.confidence,
                     citations: data.citations || [],
                     sources: data.sources || [],
+                    responseLanguageCode: data.response_language_code || "en-IN",
                   };
                 }
                 return message;
@@ -427,6 +448,56 @@ export default function VozhiApp() {
           content: "Microphone access failed. Please allow mic access and try again, or send the query as text.",
         },
       ]);
+    }
+  };
+
+  const handlePlayMessage = async (messageId: string, text: string, responseLanguageCode: string = "en-IN") => {
+    if (!text.trim()) return;
+
+    if (playingMessageId === messageId) {
+      cleanupPlayback();
+      return;
+    }
+
+    cleanupPlayback();
+    setAudioLoadingId(messageId);
+
+    try {
+      const res = await fetch("http://127.0.0.1:8000/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          language_code: responseLanguageCode,
+          speaker: "shubh",
+        }),
+      });
+      if (!res.ok) {
+        throw new Error("TTS generation failed");
+      }
+
+      const audioBlob = await res.blob();
+      const objectUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(objectUrl);
+      playbackUrlRef.current = objectUrl;
+      playbackAudioRef.current = audio;
+      setPlayingMessageId(messageId);
+      audio.onended = () => {
+        cleanupPlayback();
+      };
+      await audio.play();
+    } catch {
+      cleanupPlayback();
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-tts-error`,
+          role: "assistant",
+          content: "Audio playback failed. Please try the speaker button again.",
+        },
+      ]);
+    } finally {
+      setAudioLoadingId(null);
     }
   };
 
@@ -622,14 +693,25 @@ export default function VozhiApp() {
                         <div className="mb-2 flex items-center gap-2 text-[13px] font-medium text-zinc-500 dark:text-zinc-400">
                           <Bot className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
                           <span>Vozhi Assistant</span>
-                          {message.confidence && (
-                            <>
-                              <span className="mx-1 text-zinc-300 dark:text-zinc-700">|</span>
-                              <span className="flex items-center gap-1.5 font-mono text-[11px] tracking-tight text-green-600">
-                                <ShieldCheck className="h-3.5 w-3.5" /> Faithfulness:{" "}
-                                {(message.confidence * 100).toFixed(1)}%
-                              </span>
-                            </>
+                          {!!message.content.trim() && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void handlePlayMessage(
+                                  message.id,
+                                  message.content,
+                                  message.responseLanguageCode || "en-IN",
+                                )
+                              }
+                              className="ml-2 flex items-center gap-1 rounded-full border border-zinc-200 px-2 py-0.5 text-[11px] text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-700 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                            >
+                              {audioLoadingId === message.id ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Volume2 className="h-3.5 w-3.5" />
+                              )}
+                              <span>{playingMessageId === message.id ? "Stop Audio" : "Listen"}</span>
+                            </button>
                           )}
                         </div>
                         <div className="prose prose-sm ml-6 max-w-none whitespace-pre-wrap font-sans leading-relaxed text-zinc-800 dark:text-zinc-100">

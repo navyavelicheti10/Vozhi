@@ -1,3 +1,9 @@
+"""Legacy file-based chat history storage.
+
+The active app persists chat sessions in SQLite through `govassist/api/db.py`.
+This module is retained for the older pipeline and local reference usage.
+"""
+
 import json
 import os
 from datetime import datetime, timezone
