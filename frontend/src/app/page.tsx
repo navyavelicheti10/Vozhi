@@ -57,8 +57,17 @@ interface ChatSession {
   updatedAt: number;
 }
 
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/$/, "");
+const WHATSAPP_JOIN_CODE =
+  process.env.NEXT_PUBLIC_WHATSAPP_JOIN_CODE || "configured by your deployment";
+const WHATSAPP_NUMBER =
+  process.env.NEXT_PUBLIC_WHATSAPP_NUMBER || "configured by your deployment";
 const INITIAL_ASSISTANT_MESSAGE =
   "Namaskaram! I am Vozhi, India’s Intelligent Benefits Orchestrator. How can I help you discover and unlock government schemes today?";
+
+function apiUrl(path: string): string {
+  return `${API_BASE_URL}${path}`;
+}
 
 export default function VozhiApp() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -79,8 +88,15 @@ export default function VozhiApp() {
   const audioChunksRef = useRef<Blob[]>([]);
   const playbackAudioRef = useRef<HTMLAudioElement | null>(null);
   const playbackUrlRef = useRef<string | null>(null);
+  const sessionRef = useRef("");
+  const loadRequestIdRef = useRef(0);
+  const saveTimeoutRef = useRef<number | null>(null);
 
-  const createNewSession = useCallback(async (currentHistory: ChatSession[]) => {
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  const createNewSession = useCallback(async () => {
     const newSessionId = `web-${Math.random().toString(36).substring(7)}`;
     const initialMsg: Message = {
       id: Date.now().toString(),
@@ -95,12 +111,12 @@ export default function VozhiApp() {
       updatedAt: Date.now(),
     };
 
-    setHistory([newSession, ...currentHistory]);
+    setHistory((currentHistory) => [newSession, ...currentHistory.filter((chat) => chat.id !== newSessionId)]);
     setSession(newSessionId);
     setMessages([initialMsg]);
     setActiveTab("chat");
 
-    await fetch("http://127.0.0.1:8000/api/sessions", {
+    await fetch(apiUrl("/api/sessions"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -114,15 +130,30 @@ export default function VozhiApp() {
   useEffect(() => {
     async function loadData() {
       try {
-        const res = await fetch("http://127.0.0.1:8000/api/sessions");
-        if (!res.ok) return;
+        const res = await fetch(apiUrl("/api/sessions"));
+        if (!res.ok) throw new Error("Failed to load sessions");
 
         const loadedHistory: ChatSession[] = await res.json();
         setHistory(loadedHistory);
-        await createNewSession(loadedHistory);
+        const latestChat = [...loadedHistory].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+
+        if (!latestChat) {
+          await createNewSession();
+          return;
+        }
+
+        const sessionRes = await fetch(apiUrl(`/api/sessions/${latestChat.id}`));
+        if (!sessionRes.ok) {
+          throw new Error("Failed to load the latest chat");
+        }
+
+        const data = await sessionRes.json();
+        setSession(latestChat.id);
+        setMessages(data.messages || []);
+        setActiveTab("chat");
       } catch (e) {
         console.error("Failed to load history from DB", e);
-        await createNewSession([]);
+        await createNewSession();
       }
     }
 
@@ -160,12 +191,24 @@ export default function VozhiApp() {
         ),
       );
 
-      fetch("http://127.0.0.1:8000/api/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: session, title: newTitle, messages }),
-      }).catch(console.error);
+      if (saveTimeoutRef.current) {
+        window.clearTimeout(saveTimeoutRef.current);
+      }
+
+      saveTimeoutRef.current = window.setTimeout(() => {
+        fetch(apiUrl("/api/sessions"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: session, title: newTitle, messages }),
+        }).catch(console.error);
+      }, 300);
     }
+
+    return () => {
+      if (saveTimeoutRef.current) {
+        window.clearTimeout(saveTimeoutRef.current);
+      }
+    };
   }, [messages, session]);
 
   useEffect(() => {
@@ -194,7 +237,7 @@ export default function VozhiApp() {
   };
 
   const startNewChat = async () => {
-    await createNewSession(history);
+    await createNewSession();
   };
 
   const toggleTheme = () => {
@@ -202,12 +245,15 @@ export default function VozhiApp() {
   };
 
   const loadChat = async (chatId: string) => {
-    setSession(chatId);
     setActiveTab("chat");
+    const requestId = Date.now();
+    loadRequestIdRef.current = requestId;
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/sessions/${chatId}`);
+      const res = await fetch(apiUrl(`/api/sessions/${chatId}`));
       if (res.ok) {
         const data = await res.json();
+        if (loadRequestIdRef.current !== requestId) return;
+        setSession(chatId);
         setMessages(data.messages);
       }
     } catch (e) {
@@ -217,7 +263,7 @@ export default function VozhiApp() {
 
   const deleteChat = async (chatId: string) => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/api/sessions/${chatId}`, {
+      const res = await fetch(apiUrl(`/api/sessions/${chatId}`), {
         method: "DELETE",
       });
       if (!res.ok) {
@@ -232,9 +278,7 @@ export default function VozhiApp() {
           const nextChat = [...remainingChats].sort((a, b) => b.updatedAt - a.updatedAt)[0];
           await loadChat(nextChat.id);
         } else {
-          setSession("");
-          setMessages([]);
-          setActiveTab("home");
+          await createNewSession();
         }
       }
     } catch (e) {
@@ -247,7 +291,7 @@ export default function VozhiApp() {
     userMessageContent: string,
     options?: { replaceUserMessageWithTranscript?: boolean },
   ) => {
-    if (!session) return;
+    if (!sessionRef.current) return;
 
     const userId = Date.now().toString();
     const assistantId = `${userId}-assistant`;
@@ -267,7 +311,7 @@ export default function VozhiApp() {
     setLoading(true);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/chat/stream", request);
+      const res = await fetch(apiUrl("/chat/stream"), request);
       if (!res.ok) throw new Error("API Error");
       if (!res.body) throw new Error("Streaming body unavailable");
 
@@ -364,7 +408,7 @@ export default function VozhiApp() {
 
     if (uploadedDoc) {
       const formData = new FormData();
-      formData.append("session_id", session);
+      formData.append("session_id", sessionRef.current);
       formData.append("query", trimmedInput);
       formData.append("file", uploadedDoc);
       await streamChatResponse(
@@ -381,7 +425,7 @@ export default function VozhiApp() {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: trimmedInput, session_id: session }),
+        body: JSON.stringify({ query: trimmedInput, session_id: sessionRef.current }),
       },
       trimmedInput,
     );
@@ -424,7 +468,7 @@ export default function VozhiApp() {
         audioChunksRef.current = [];
 
         const formData = new FormData();
-        formData.append("session_id", session);
+        formData.append("session_id", sessionRef.current);
         formData.append("file", audioFile);
         void streamChatResponse(
           {
@@ -463,7 +507,7 @@ export default function VozhiApp() {
     setAudioLoadingId(messageId);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/tts", {
+      const res = await fetch(apiUrl("/tts"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -662,8 +706,8 @@ export default function VozhiApp() {
                     Omnichannel Voice
                   </h3>
                   <p className="text-sm leading-relaxed text-zinc-500 dark:text-zinc-400">
-                    Integrated with Sarvam AI and Twilio WhatsApp to ensure rural access.
-                    Speak in any Indian language and get native audio responses.
+                    Integrated with Sarvam AI for speech-to-text and audio playback,
+                    with optional WhatsApp delivery for mobile-first access.
                   </p>
                 </div>
 
@@ -675,8 +719,8 @@ export default function VozhiApp() {
                     Document Intelligence
                   </h3>
                   <p className="text-sm leading-relaxed text-zinc-500 dark:text-zinc-400">
-                    Upload Aadhaar or Income Certificates. EasyOCR and Llama 3.2 Vision
-                    instantly extract exact demographic entities to prove eligibility.
+                    Upload Aadhaar or income documents. PDF extraction and OCR pull key
+                    fields into the scheme-matching flow for better guidance.
                   </p>
                 </div>
               </div>
@@ -851,11 +895,11 @@ export default function VozhiApp() {
             <p className="text-sm text-zinc-700 dark:text-zinc-200">
               2. Send{" "}
               <span className="select-all rounded bg-zinc-200 px-1 py-0.5 font-mono text-xs dark:bg-zinc-700">
-                join familiar-metal
+                {WHATSAPP_JOIN_CODE}
               </span>{" "}
               to{" "}
               <span className="rounded bg-zinc-200 px-1 py-0.5 font-mono text-xs dark:bg-zinc-700">
-                +1 415 523 8886
+                {WHATSAPP_NUMBER}
               </span>
             </p>
             <p className="text-sm text-zinc-700 dark:text-zinc-200">

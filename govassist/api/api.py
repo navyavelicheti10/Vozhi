@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import shutil
@@ -15,9 +16,8 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
 from govassist.agents.graph import govassist_graph
-from govassist.agents import nodes as agent_nodes
 from govassist.api.db import delete_session, get_all_sessions, get_session, init_db as init_chat_db, save_session
-from govassist.api.db_utils import ingest_schemes_to_qdrant, init_db as init_schemes_db
+from govassist.api.db_utils import init_db as init_schemes_db
 from govassist.config import load_env_file
 from govassist.integrations.sarvam import sarvam_client
 
@@ -35,6 +35,17 @@ TEMP_DIR = PROJECT_ROOT / "temp_uploads"
 TEXT_MIME_TYPES = {"application/json"}
 DOCUMENT_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac"}
+
+
+def _allowed_origins() -> list[str]:
+    raw_value = os.getenv("CORS_ALLOW_ORIGINS", "")
+    origins = [origin.strip() for origin in raw_value.split(",") if origin.strip()]
+    if origins:
+        return origins
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 
 
 class SaveSessionRequest(BaseModel):
@@ -150,10 +161,26 @@ def _format_chat_response(session_id: str, state: dict[str, Any]) -> dict[str, A
     }
 
 
-def _merge_state(base_state: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base_state)
-    merged.update(updates)
-    return merged
+def _iter_answer_chunks(answer: str, chunk_size: int = 120) -> list[str]:
+    normalized = (answer or "").strip()
+    if not normalized:
+        return []
+
+    words = normalized.split()
+    chunks: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) <= chunk_size:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current + " ")
+        current = word
+
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def _parse_chat_request(request: Request) -> ParsedChatRequest:
@@ -256,7 +283,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -380,60 +407,16 @@ async def chat_stream(request: Request):
 
     async def event_stream():
         try:
-            routed_state = _merge_state(state, agent_nodes.main_agent(state))
-
             if parsed_request.transcribed_text:
                 yield json.dumps({"type": "transcript", "content": parsed_request.transcribed_text}) + "\n"
+            config = {"configurable": {"thread_id": parsed_request.session_id}}
+            result_state = await asyncio.to_thread(govassist_graph.invoke, state, config)
+            final_payload = _format_chat_response(parsed_request.session_id, result_state)
 
-            if routed_state.get("rag_completed") and routed_state.get("final_package"):
-                final_payload = _format_chat_response(parsed_request.session_id, routed_state)
-                yield json.dumps({"type": "chunk", "content": final_payload["answer"]}) + "\n"
-                yield json.dumps({"type": "final", "data": final_payload}) + "\n"
-                return
+            for chunk in _iter_answer_chunks(final_payload["answer"]):
+                yield json.dumps({"type": "chunk", "content": chunk}) + "\n"
 
-            llm_state = _merge_state(routed_state, agent_nodes.llm_agent(routed_state))
-
-            if llm_state.get("rag_completed") and llm_state.get("final_package"):
-                final_payload = _format_chat_response(parsed_request.session_id, llm_state)
-                yield json.dumps({"type": "chunk", "content": final_payload["answer"]}) + "\n"
-                yield json.dumps({"type": "final", "data": final_payload}) + "\n"
-                return
-
-            rag_state = _merge_state(llm_state, agent_nodes.rag_agent(llm_state))
-            agent_nodes._ensure_llm()
-            if agent_nodes.llm is None:
-                raise RuntimeError("LLM client could not be initialized for streaming.")
-
-            messages = agent_nodes.build_post_rag_messages(rag_state)
-            chunks: list[str] = []
-            async for chunk in agent_nodes.llm.astream(messages):
-                content = getattr(chunk, "content", "")
-                if isinstance(content, list):
-                    text = "".join(
-                        item.get("text", "") if isinstance(item, dict) else str(item)
-                        for item in content
-                    )
-                else:
-                    text = str(content or "")
-
-                if not text:
-                    continue
-
-                chunks.append(text)
-                yield json.dumps({"type": "chunk", "content": text}) + "\n"
-
-            final_text = "".join(chunks).strip()
-            metadata = agent_nodes.build_post_rag_metadata(rag_state)
-            final_state = _merge_state(
-                rag_state,
-                {
-                    "final_package": final_text,
-                    "citations": metadata["citations"],
-                    "sources": metadata["sources"],
-                    "confidence_score": metadata["confidence_score"],
-                },
-            )
-            yield json.dumps({"type": "final", "data": _format_chat_response(parsed_request.session_id, final_state)}) + "\n"
+            yield json.dumps({"type": "final", "data": final_payload}) + "\n"
         except Exception as exc:
             logger.exception("Streaming chat request failed")
             yield json.dumps({"type": "error", "detail": f"Chat orchestration failed: {exc}"}) + "\n"
@@ -473,13 +456,10 @@ def scrape(background_tasks: BackgroundTasks, ingest_after_scrape: bool = True):
             subprocess.run(
                 [sys.executable, str(PROJECT_ROOT / "scrape.py")],
                 cwd=str(PROJECT_ROOT),
+                env={**os.environ, "AUTO_INGEST": "true" if ingest_after_scrape else "false"},
                 check=True,
             )
-            logger.info("Scraper completed and SQLite was updated")
-
-            if ingest_after_scrape:
-                ingested = ingest_schemes_to_qdrant()
-                logger.info("Qdrant ingestion completed for %s schemes", ingested)
+            logger.info("Scraper completed. SQLite and downstream index refresh follow scraper settings.")
         except Exception:
             logger.exception("Scrape pipeline failed")
 
@@ -489,3 +469,101 @@ def scrape(background_tasks: BackgroundTasks, ingest_after_scrape: bool = True):
         "message": "Scraper started. Results will be stored in SQLite.",
         "ingest_after_scrape": ingest_after_scrape,
     }
+
+
+async def process_twilio_message_bg(msg_data: dict):
+    from govassist.integrations.twilio import twilio_client
+    
+    session_id = msg_data.get("from", "default")
+    user_number = msg_data.get("from", "")
+    text = msg_data.get("body", "").strip()
+    media_url = msg_data.get("media_url", "")
+    media_type = msg_data.get("media_type", "")
+    
+    input_type = "text"
+    query_text = text
+    uploaded_file_path = None
+    transcribed_text = ""
+    query_language_code = "en-IN"
+    response_language_code = "en-IN"
+    raw_query = text
+
+    try:
+        if media_url:
+            _ensure_temp_dir()
+            filename = f"{session_id.replace('+', '')}_twilio_media"
+            save_path = str(TEMP_DIR / filename)
+            dl_path = twilio_client.download_media(media_url, save_path)
+            
+            if dl_path:
+                uploaded_file_path = Path(dl_path)
+                if media_type.startswith("audio/"):
+                    input_type = "audio"
+                    stt_payload = sarvam_client.speech_to_text_with_metadata(dl_path)
+                    transcribed_text = stt_payload.get("transcript", "").strip()
+                    if not transcribed_text:
+                        twilio_client.send_proactive_message(user_number, "Audio transcription failed.")
+                        return
+                    query_language_code = stt_payload.get("language_code", "en-IN")
+                    response_language_code = query_language_code
+                    raw_query = transcribed_text
+                    
+                    if query_language_code != "en-IN":
+                        translated = sarvam_client.translate_text(
+                            text=transcribed_text,
+                            source_language_code=query_language_code,
+                            target_language_code="en-IN",
+                        )
+                        query_text = translated.get("translated_text", transcribed_text).strip() or transcribed_text
+                    else:
+                        query_text = transcribed_text
+                elif media_type.startswith("image/"):
+                    input_type = "document"
+                    query_text = text
+        elif query_text:
+            translated = sarvam_client.translate_text(
+                text=query_text,
+                source_language_code="auto",
+                target_language_code="en-IN",
+            )
+            query_language_code = translated.get("source_language_code", "en-IN")
+            response_language_code = query_language_code
+            if query_language_code != "en-IN":
+                query_text = translated.get("translated_text", query_text).strip() or query_text
+
+        state = _build_state(
+            input_type=input_type,
+            query_text=query_text,
+            session_id=session_id,
+            uploaded_file_path=uploaded_file_path,
+            transcribed_text=transcribed_text,
+            raw_query=raw_query,
+            query_language_code=query_language_code,
+            response_language_code=response_language_code,
+        )
+        config = {"configurable": {"thread_id": session_id}}
+        result_state = await asyncio.to_thread(govassist_graph.invoke, state, config)
+        
+        final_payload = _format_chat_response(session_id, result_state)
+        answer = final_payload.get("answer", "")
+        
+        twilio_client.send_proactive_message(user_number, answer)
+
+    except Exception as exc:
+        logger.exception("Twilio background processing failed")
+        twilio_client.send_proactive_message(user_number, "Sorry, I am having trouble connecting to the Vozhi Orchestrator right now.")
+    finally:
+        if uploaded_file_path and uploaded_file_path.exists():
+            uploaded_file_path.unlink(missing_ok=True)
+
+
+@app.post("/webhook/twilio")
+async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
+    from govassist.integrations.twilio import twilio_client
+    form = await request.form()
+    msg_data = twilio_client.parse_incoming_message(dict(form))
+
+    fast_twiml = twilio_client.generate_twiml_response("")
+    background_tasks.add_task(process_twilio_message_bg, msg_data)
+
+    return Response(content=fast_twiml, media_type="application/xml")

@@ -101,6 +101,16 @@ npm install
 npm run dev
 ```
 
+Optional frontend env:
+
+```env
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_WHATSAPP_NUMBER=+1 415 523 8886
+NEXT_PUBLIC_WHATSAPP_JOIN_CODE=join your-code
+```
+
+If `NEXT_PUBLIC_API_BASE_URL` is omitted, the frontend uses same-origin relative paths.
+
 ## Backend Setup
 
 Create a `.env` file in the repo root:
@@ -115,6 +125,7 @@ FORCE_RECREATE_COLLECTION=false
 QDRANT_MODE=local
 QDRANT_LOCAL_PATH=./qdrant_data
 API_BASE_URL=http://127.0.0.1:8000
+CORS_ALLOW_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 TWILIO_ACCOUNT_SID=
 TWILIO_AUTH_TOKEN=
 TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
@@ -165,4 +176,5 @@ They are not on the active FastAPI + LangGraph runtime path.
 
 - The backend root no longer attempts to serve a stale `web/index.html`.
 - The active UI is the Next.js app, not the older Vue-based description from earlier project docs.
-- Streaming now supports text, audio, and document requests through the same API route.
+- Streaming now uses the same graph-backed orchestration path as blocking chat for text, audio, and document requests.
+- Standalone `scrape.py` and `POST /scrape` both auto-refresh Qdrant and the graph store when `AUTO_INGEST=true`.

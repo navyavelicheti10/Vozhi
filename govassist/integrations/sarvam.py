@@ -137,6 +137,16 @@ class SarvamAIClient:
     def _chunk_batches(self, items: list[str], batch_size: int = 3) -> list[list[str]]:
         return [items[index:index + batch_size] for index in range(0, len(items), batch_size)]
 
+    def _build_silence_wav(self, duration_ms: int = 500, sample_rate: int = 24000) -> bytes:
+        frame_count = max(int(sample_rate * (duration_ms / 1000)), 1)
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(b"\x00\x00" * frame_count)
+        return buffer.getvalue()
+
     def speech_to_text(self, audio_file_path: str, language_code: str = "unknown") -> str:
         """Transcribes incoming voice note."""
         result = self.speech_to_text_with_metadata(audio_file_path=audio_file_path, language_code=language_code)
@@ -252,8 +262,8 @@ class SarvamAIClient:
         """Generates WAV audio bytes from text."""
         api_key = self._refresh_api_key()
         if not api_key:
-            logger.info("Mock TTS: returning empty audio.")
-            return b""
+            logger.info("Mock TTS: returning a short silent WAV clip.")
+            return self._build_silence_wav()
             
         url = f"{self.base_url}/text-to-speech"
         segments = self._split_tts_segments(text=text, max_chars=500)

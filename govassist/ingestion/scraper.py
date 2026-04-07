@@ -1,8 +1,10 @@
 import json
+import logging
 import os
 import re
 from playwright.async_api import async_playwright
 
+logger = logging.getLogger(__name__)
 OUTPUT_FILE = os.getenv("SCRAPE_OUTPUT_FILE", "data/raw/scheme.json")
 MAX_SCHEMES_PER_CATEGORY = int(os.getenv("MAX_SCHEMES_PER_CATEGORY", "0")) or None
 
@@ -198,7 +200,7 @@ async def extract_section(page, keywords):
 
 # ✅ GET LINKS
 async def get_scheme_links(page, url):
-    print(f"\n🌐 Opening: {url}")
+    logger.info("Opening category page: %s", url)
 
     await page.goto(url, timeout=60000)
     await page.wait_for_load_state("networkidle")
@@ -221,7 +223,7 @@ async def get_scheme_links(page, url):
         if l and "/schemes/" in l and len(l.split("/schemes/")[-1]) < 40
     ]))
 
-    print(f"🔗 Found {len(links)} scheme links")
+    logger.info("Found %s scheme links", len(links))
     return links
 
 
@@ -246,9 +248,9 @@ async def scrape_scheme(page, url, category):
                     if await close_btn.is_visible():
                         await close_btn.click()
                         await page.wait_for_timeout(500)
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
 
         # Wait for title properly
@@ -260,18 +262,13 @@ async def scrape_scheme(page, url, category):
         if not name or len(name.strip()) == 0:
             name = await page.title()
 
-        print("TITLE DEBUG:", name)
+        logger.debug("Scraping scheme title: %s", name)
 
         details = await extract_section(page, ["details", "description", "about the scheme"])
-        print(f"DEBUG: Details extracted: {details[:200]}...")
         eligibility = await extract_section(page, ["eligibility"])
-        print(f"DEBUG: Eligibility extracted: {eligibility[:200]}...")
         benefits = await extract_section(page, ["benefits"])
-        print(f"DEBUG: Benefits extracted: {benefits[:200]}...")
         documents = await extract_section(page, ["documents required", "document required", "documents"])
-        print(f"DEBUG: Documents extracted: {documents[:200]}...")
         application = await extract_section(page, ["application process", "how to apply"])
-        print(f"DEBUG: Application extracted: {application[:200]}...")
 
         if not details:
             # Try to get content from main or specific containers
@@ -283,7 +280,7 @@ async def scrape_scheme(page, url, category):
                     if len(main_content) > 100 and not is_noise(main_content[:500]):
                         details = main_content[:1500]
                         break
-                except:
+                except Exception:
                     continue
 
         documents_list = split_items(documents)
@@ -300,11 +297,11 @@ async def scrape_scheme(page, url, category):
             "tags": []
         }
 
-        print(f"✅ {scheme['scheme_name']}")
+        logger.info("Scraped scheme: %s", scheme["scheme_name"])
         return scheme
 
     except Exception as e:
-        print(f"❌ Error: {url} → {e}")
+        logger.exception("Failed to scrape scheme %s: %s", url, e)
         return None
 
 
@@ -323,7 +320,7 @@ async def main():
 
         for url in CATEGORY_URLS:
             category = url.split("/")[-1]
-            print(f"\n📂 CATEGORY: {category}")
+            logger.info("Processing category: %s", category)
 
             links = await get_scheme_links(page, url)
 
@@ -339,12 +336,19 @@ async def main():
                 await page.wait_for_timeout(1500)
 
     try:
+        output_path = OUTPUT_FILE
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as file:
+            json.dump(all_data, file, ensure_ascii=False, indent=2)
+
         from govassist.api.db_utils import insert_scheme
         for scheme in all_data:
             insert_scheme(scheme)
-        print(f"\n🎉 DONE! Saved {len(all_data)} schemes to SQLite Database")
+        logger.info("Saved %s schemes to SQLite and exported JSON to %s", len(all_data), output_path)
     except Exception as e:
-        print(f"Failed to save to SQLite: {e}")
+        logger.exception("Failed to persist scraped schemes: %s", e)
 
 
 if __name__ == "__main__":

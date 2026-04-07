@@ -16,9 +16,12 @@ def route_after_document(_: AgentState) -> str:
 
 
 def route_after_main(state: AgentState) -> str:
-    if state.get("route") == "respond":
-        return "LLMAgent"
-    return "RAGAgent"
+    if state.get("rag_completed"):
+        return END
+    # Ensure all inputs route through LLMAgent.
+    # 'respond' routes will be instantly answered and closed.
+    # 'retrieve' routes will be refined (pre-RAG) and passed to RAGAgent.
+    return "LLMAgent"
 
 
 def route_after_llm(state: AgentState) -> str:

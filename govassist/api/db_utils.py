@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import sqlite3
 from contextlib import closing
@@ -44,6 +45,19 @@ def init_db() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            DELETE FROM schemes
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM schemes
+                GROUP BY scheme_name
+            )
+            """
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_schemes_scheme_name ON schemes (scheme_name)"
+        )
         connection.commit()
 
 
@@ -71,64 +85,41 @@ def upsert_scheme(scheme: Dict[str, Any]) -> None:
     }
 
     with closing(_connect()) as connection:
-        existing = connection.execute(
-            "SELECT id FROM schemes WHERE scheme_name = ?",
-            (record["scheme_name"],),
-        ).fetchone()
-
-        if existing:
-            connection.execute(
-                """
-                UPDATE schemes
-                SET category = ?,
-                    description = ?,
-                    eligibility = ?,
-                    benefits = ?,
-                    documents_required = ?,
-                    application_process = ?,
-                    official_link = ?,
-                    raw_json = ?
-                WHERE id = ?
-                """,
-                (
-                    record["category"],
-                    record["description"],
-                    record["eligibility"],
-                    record["benefits"],
-                    record["documents_required"],
-                    record["application_process"],
-                    record["official_link"],
-                    record["raw_json"],
-                    int(existing["id"]),
-                ),
-            )
-        else:
-            connection.execute(
-                """
-                INSERT INTO schemes (
-                    scheme_name,
-                    category,
-                    description,
-                    eligibility,
-                    benefits,
-                    documents_required,
-                    application_process,
-                    official_link,
-                    raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record["scheme_name"],
-                    record["category"],
-                    record["description"],
-                    record["eligibility"],
-                    record["benefits"],
-                    record["documents_required"],
-                    record["application_process"],
-                    record["official_link"],
-                    record["raw_json"],
-                ),
-            )
+        connection.execute(
+            """
+            INSERT INTO schemes (
+                scheme_name,
+                category,
+                description,
+                eligibility,
+                benefits,
+                documents_required,
+                application_process,
+                official_link,
+                raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scheme_name) DO UPDATE SET
+                category = excluded.category,
+                description = excluded.description,
+                eligibility = excluded.eligibility,
+                benefits = excluded.benefits,
+                documents_required = excluded.documents_required,
+                application_process = excluded.application_process,
+                official_link = excluded.official_link,
+                raw_json = excluded.raw_json
+            """,
+            (
+                record["scheme_name"],
+                record["category"],
+                record["description"],
+                record["eligibility"],
+                record["benefits"],
+                record["documents_required"],
+                record["application_process"],
+                record["official_link"],
+                record["raw_json"],
+            ),
+        )
         connection.commit()
 
 
@@ -227,7 +218,7 @@ def search_schemes_in_db(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     return scored_results[:top_k]
 
 
-def ingest_schemes_to_qdrant() -> int:
+def ingest_schemes_to_qdrant(force_recreate: bool | None = None) -> int:
     from govassist.rag.embeddings import EmbeddingService
     from govassist.rag.vector_store import QdrantManager
 
@@ -236,9 +227,15 @@ def ingest_schemes_to_qdrant() -> int:
         logger.info("No schemes found in SQLite. Skipping Qdrant ingestion.")
         return 0
 
+    if force_recreate is None:
+        force_recreate = os.getenv("FORCE_RECREATE_COLLECTION", "false").lower() == "true"
+
     embedding_service = EmbeddingService(model_name="BAAI/bge-small-en-v1.5")
     qdrant = QdrantManager(collection_name="schemes")
-    qdrant.ensure_collection(vector_size=embedding_service.vector_size)
+    if force_recreate:
+        qdrant.recreate_collection(vector_size=embedding_service.vector_size)
+    else:
+        qdrant.ensure_collection(vector_size=embedding_service.vector_size)
 
     texts: List[str] = []
     payloads: List[Dict[str, Any]] = []
@@ -274,3 +271,19 @@ def ingest_schemes_to_qdrant() -> int:
     qdrant.upsert_schemes(schemes=payloads, embeddings=vectors)
     logger.info("Ingested %s schemes into Qdrant", len(payloads))
     return len(payloads)
+
+
+def rebuild_graph_store_from_db(force_rebuild: bool = True) -> int:
+    # Graph store decommissioned
+    return 0
+
+
+def refresh_indexes_from_db(
+    force_recreate_collection: bool | None = None,
+    force_rebuild_graph: bool = True,
+) -> Dict[str, int]:
+    qdrant_count = ingest_schemes_to_qdrant(force_recreate=force_recreate_collection)
+    return {
+        "qdrant_count": qdrant_count,
+        "graph_count": 0,
+    }

@@ -12,7 +12,6 @@ from govassist.api.db_utils import search_schemes_in_db
 from govassist.config import load_env_file
 from govassist.integrations.sarvam import sarvam_client
 from govassist.rag.embeddings import EmbeddingService, clean_text
-from govassist.rag.graph_store import GraphStoreManager
 from govassist.rag.vector_store import QdrantManager
 
 logger = logging.getLogger(__name__)
@@ -20,7 +19,6 @@ logger = logging.getLogger(__name__)
 llm: ChatGroq | None = None
 embedding_service: EmbeddingService | None = None
 qdrant: QdrantManager | None = None
-graph_manager: GraphStoreManager | None = None
 ocr_reader = None
 
 GREETING_PATTERNS = (
@@ -181,11 +179,11 @@ def _ensure_llm() -> None:
         return
 
     load_env_file()
-    llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.2)
+    llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.2, max_retries=10)
 
 
 def _ensure_rag_clients() -> None:
-    global embedding_service, qdrant, graph_manager
+    global embedding_service, qdrant
 
     _ensure_llm()
 
@@ -194,13 +192,6 @@ def _ensure_rag_clients() -> None:
 
     if qdrant is None:
         qdrant = QdrantManager(collection_name="schemes")
-
-    if graph_manager is None:
-        graph_manager = GraphStoreManager()
-        try:
-            graph_manager.load_or_create()
-        except Exception as exc:
-            logger.warning("Graph store could not be loaded. Synergy retrieval will be skipped: %s", exc)
 
 
 def _get_or_init_ocr_reader():
@@ -305,6 +296,14 @@ def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMes
         "- Do not output JSON.\n"
         f"- Write the final answer entirely in {response_language}."
     )
+    
+    messages = [SystemMessage(content=system_prompt)]
+    
+    chat_history = state.get("messages", [])
+    if len(chat_history) > 1:
+        # Pass up to the last 6 messages (excluding the current one) to supply context
+        messages.extend(chat_history[-7:-1])
+
     human_prompt = (
         f"User query: {current_query}\n"
         f"User profile: {json.dumps(user_profile, ensure_ascii=True)}\n"
@@ -312,10 +311,9 @@ def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMes
         f"Retrieved schemes: {json.dumps(trimmed_schemes, ensure_ascii=True)}\n"
         f"Synergy schemes: {json.dumps(synergies, ensure_ascii=True)}"
     )
-    return [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=human_prompt),
-    ]
+    
+    messages.append(HumanMessage(content=human_prompt))
+    return messages
 
 
 def build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMessage]:
@@ -357,7 +355,17 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content=fallback)],
         }
 
-    response = llm.invoke(_build_post_rag_messages(state))
+    try:
+        response = llm.invoke(_build_post_rag_messages(state))
+        content = response.content.strip()
+    except Exception as exc:
+        logger.warning("LLM post-RAG synthesis failed (possibly Rate Limit): %s", exc)
+        fallback_lines = ["I found some relevant schemes for you (Note: Intelligent synthesis delayed due to high load):\n"]
+        for scheme in schemes:
+            name = scheme.get("scheme_name", "Unknown Scheme")
+            fallback_lines.append(f"- **{name}**: {scheme.get('description', '')[:200]}...")
+        content = "\n".join(fallback_lines)
+
     citations = [
         scheme.get("scheme_name")
         for scheme in schemes
@@ -365,11 +373,11 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
     ]
 
     return {
-        "final_package": response.content.strip(),
+        "final_package": content,
         "confidence_score": _calculate_confidence(schemes),
         "citations": citations,
         "sources": _build_sources(schemes),
-        "messages": [AIMessage(content=response.content.strip())],
+        "messages": [AIMessage(content=content)],
     }
 
 
@@ -441,19 +449,34 @@ def _pre_rag_query_refinement(state: AgentState) -> Dict[str, Any]:
         seed_query = "Find relevant government schemes using the uploaded document details."
 
     prompt = (
-        "You normalize queries for government-scheme retrieval.\n"
-        "Return only one short retrieval query.\n"
-        "Preserve important facts such as state, profile, document hints, category, and benefit intent.\n"
+        "You normalize conversational queries into semantic search keywords for a Vector Database.\n"
+        "Return only a short, generic string of keywords (DO NOT write SQL, JSON, or code).\n"
+        "Preserve important facts such as state, demographics, document hints, and benefit intent.\n"
         "Do not add explanations or formatting."
     )
+    
+    chat_history = state.get("messages", [])
+    history_str = ""
+    if len(chat_history) > 1:
+        history_str = "Conversation History:\n" + "\n".join(
+            f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}" 
+            for m in chat_history[-5:-1]
+        ) + "\n\n"
+        
     human_content = seed_query if not document_context else f"{seed_query}\n\n{document_context}"
-    response = llm.invoke(
-        [
-            SystemMessage(content=prompt),
-            HumanMessage(content=human_content),
-        ]
-    )
-    normalized_query = clean_text(response.content).strip("\"'")
+    human_content = history_str + f"Latest User Query: {human_content}"
+
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(content=human_content),
+            ]
+        )
+        normalized_query = clean_text(response.content).strip("\"'")
+    except Exception as exc:
+        logger.warning("LLM query refinement failed, falling back to original query: %s", exc)
+        normalized_query = seed_query
 
     return {"current_query": normalized_query or seed_query}
 
@@ -469,11 +492,37 @@ def llm_agent(state: AgentState) -> Dict[str, Any]:
     )
     if state.get("route") == "respond":
         logger.info("Answering directly without RAG for query: %s", seed_query)
-        reply = (
-            _build_small_talk_response(seed_query)
-            if (_is_small_talk(seed_query) or _is_assistant_meta_query(seed_query))
-            else _build_out_of_scope_response()
+        
+        system_prompt = (
+            "You are Vozhi, a conversational AI for Indian government schemes.\n"
+            "The user asked a general question, made small talk, or provided personal context.\n"
+            "Use the conversation history to give a short, friendly, and helpful response. If they are asking out-of-scope questions, gently steer them back to schemes."
         )
+        
+        chat_history = state.get("messages", [])
+        history_str = ""
+        if len(chat_history) > 1:
+            history_str = "Conversation History:\n" + "\n".join(
+                f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content[:500]}" 
+                for m in chat_history[-6:-1]
+            ) + "\n\n"
+            
+        human_content = history_str + f"Latest User Query: {seed_query}"
+        
+        try:
+            _ensure_llm()
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=human_content)
+            ])
+            reply = clean_text(response.content)
+        except Exception as exc:
+            logger.warning("LLM direct answer failed: %s", exc)
+            reply = (
+                _build_small_talk_response(seed_query)
+                if (_is_small_talk(seed_query) or _is_assistant_meta_query(seed_query))
+                else _build_out_of_scope_response()
+            )
         reply = _localize_text(reply, state)
         return {
             "current_query": seed_query,
@@ -509,24 +558,33 @@ def document_agent(state: AgentState) -> Dict[str, Any]:
         }
 
     suffix = file_path.suffix.lower()
-    extracted_text = _extract_pdf_text(file_path) if suffix == ".pdf" else _extract_image_text(file_path)
-
+    extracted_text = ""
     structured_fields: Dict[str, Any] = {}
+    
+    if suffix == ".pdf":
+        extracted_text = _extract_pdf_text(file_path)
+    else:
+        logger.info("Routing image %s to EasyOCR extraction.", file_path.name)
+        extracted_text = _extract_image_text(file_path)
+
     if extracted_text:
         parser_prompt = (
             "Extract basic structured fields from the document text.\n"
             "Return only a JSON object with keys when available: "
             "document_type, name, dob, gender, state, district, income_amount, occupation, id_number, notes."
         )
-        response = llm.invoke(
-            [
-                SystemMessage(content=parser_prompt),
-                HumanMessage(content=extracted_text[:5000]),
-            ]
-        )
-        structured_fields = _safe_json_loads(response.content)
+        try:
+            response = llm.invoke(
+                [
+                    SystemMessage(content=parser_prompt),
+                    HumanMessage(content=extracted_text[:5000]),
+                ]
+            )
+            structured_fields = _safe_json_loads(response.content)
+        except Exception as e:
+            logger.warning("LLM structured parsing failed: %s", e)
 
-    if not extracted_text:
+    if not extracted_text and not structured_fields:
         logger.warning("No text could be extracted from document %s", file_path)
 
     return {
@@ -548,7 +606,6 @@ def rag_agent(state: AgentState) -> Dict[str, Any]:
         logger.warning("RAG agent received an empty query")
         return {
             "retrieved_schemes": [],
-            "synergy_schemes": [],
             "rag_completed": True,
         }
 
@@ -561,22 +618,9 @@ def rag_agent(state: AgentState) -> Dict[str, Any]:
         logger.warning("Vector retrieval failed for query '%s': %s", query, exc)
 
     if not semantic_results:
-        logger.info("Falling back to SQLite retrieval for query: %s", query)
         semantic_results = search_schemes_in_db(query=query, top_k=5)
-
-    synergy_payload: List[Dict[str, Any]] = []
-    try:
-        raw_synergies = graph_manager.search_synergies(query, top_k=3) if graph_manager else []
-        synergy_payload = [
-            {"summary": clean_text(item)}
-            for item in raw_synergies
-            if clean_text(item)
-        ]
-    except Exception as exc:
-        logger.warning("Graph synergy retrieval failed: %s", exc)
 
     return {
         "retrieved_schemes": semantic_results,
-        "synergy_schemes": synergy_payload,
         "rag_completed": True,
     }

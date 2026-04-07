@@ -24,7 +24,6 @@ class AgentState(TypedDict, total=False):
     route: str
     # RAG retrievals
     retrieved_schemes: List[Dict[str, Any]]
-    synergy_schemes: List[Dict[str, Any]]
     rag_completed: bool
 
     # Final response
