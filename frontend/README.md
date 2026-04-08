@@ -26,8 +26,8 @@ Set frontend env vars when the backend or WhatsApp onboarding values differ from
 
 ```bash
 NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
-NEXT_PUBLIC_WHATSAPP_NUMBER=+1 415 523 8886
-NEXT_PUBLIC_WHATSAPP_JOIN_CODE=join your-code
+NEXT_PUBLIC_WHATSAPP_NUMBER=+14155238886
+NEXT_PUBLIC_WHATSAPP_JOIN_CODE=join grandfather-held
 ```
 
 If `NEXT_PUBLIC_API_BASE_URL` is omitted, the UI uses same-origin relative paths.

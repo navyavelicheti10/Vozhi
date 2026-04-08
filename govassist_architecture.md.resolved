@@ -1,0 +1,197 @@
+# GovAssist-RAG — System Architecture
+
+## High-Level Layer Overview
+
+```mermaid
+graph TB
+    subgraph PRESENTATION["🖥️ Presentation — Next.js (frontend/)"]
+        UI["Chat UI · page.tsx"]
+        COMP["Components: button · card\ndialog · textarea · theme-toggle"]
+    end
+
+    subgraph CHANNELS["📡 Input Channels"]
+        WEB["Web Browser\nHTTP / SSE"]
+        WA["WhatsApp\nTwilio Webhook"]
+    end
+
+    subgraph API["⚡ API Layer — FastAPI (govassist/api/)"]
+        EP_CHAT["POST /chat"]
+        EP_STREAM["POST /chat/stream"]
+        EP_TTS["POST /tts"]
+        EP_SCRAPE["POST /scrape"]
+        EP_WA["POST /webhook/twilio"]
+        EP_SESS["GET·POST·DELETE /api/sessions"]
+        PARSER["_parse_chat_request()\n_parse_twilio_to_chat_request()"]
+        STATE_BUILD["_build_state()"]
+    end
+
+    subgraph ORCH["🤖 Orchestration — LangGraph (govassist/agents/)"]
+        GRAPH["StateGraph · graph.py"]
+        MAIN["MainAgent\nPlanner / Router"]
+        DOC["DocumentAgent\nOCR + Fields"]
+        LLM["LLMAgent\nRefine + Synthesize"]
+        RAG["RAGAgent\nVector Search"]
+    end
+
+    subgraph RAG_PIPE["🔍 RAG Pipeline (govassist/rag/)"]
+        EMBED["EmbeddingService\nBAAI/bge-small-en-v1.5"]
+        VSTORE["QdrantManager"]
+    end
+
+    subgraph INTEGRATIONS["🔗 Integrations"]
+        SARVAM["Sarvam AI\nLLM · STT · TTS · Translate"]
+        TWILIO["Twilio Client\nSend · Receive · Media"]
+    end
+
+    subgraph STORAGE["🗄️ Storage"]
+        SQLITE_S["SQLite schemes.db"]
+        SQLITE_C["SQLite chat_history.db"]
+        QDRANT["Qdrant Vector DB\nschemes collection"]
+        TEMPFS["temp_uploads/"]
+        MEMSAVER["MemorySaver\nLangGraph checkpointer"]
+    end
+
+    subgraph INGESTION["🕸️ Data Pipeline"]
+        SPIDER["Playwright Scraper\nscraper.py"]
+        INGEST_S["SQLite insert_scheme()"]
+        INGEST_Q["Qdrant refresh_indexes_from_db()"]
+    end
+
+    UI --> WEB --> EP_CHAT & EP_STREAM & EP_TTS & EP_SESS
+    WA --> EP_WA
+    EP_CHAT & EP_STREAM & EP_WA --> PARSER --> STATE_BUILD --> GRAPH
+    GRAPH --> MAIN & DOC
+    DOC --> MAIN --> LLM --> RAG --> LLM
+    RAG --> EMBED --> QDRANT
+    RAG --> SQLITE_S
+    LLM & DOC & MAIN --> SARVAM
+    GRAPH --> MEMSAVER
+    EP_SESS --> SQLITE_C
+    PARSER --> TEMPFS
+    EP_WA --> TWILIO
+    EP_SCRAPE --> SPIDER --> INGEST_S --> INGEST_Q
+    INGEST_S --> SQLITE_S
+    INGEST_Q --> QDRANT
+```
+
+---
+
+## LangGraph Agent Routing
+
+```mermaid
+flowchart TD
+    START(["▶ START"])
+    END_NODE(["⏹ END"])
+
+    START -->|"input_type = document"| DOC_AGENT["📄 DocumentAgent\n─────────────────\nPDF → pypdf text\nImage → EasyOCR\nLLM → structured fields\nname · dob · state · income"]
+    START -->|"input_type = text / audio"| MAIN_AGENT
+
+    DOC_AGENT -->|always| MAIN_AGENT["🧭 MainAgent — Planner\n──────────────────────────\nSmall talk      → respond\nMeta query      → respond\nScheme keyword  → retrieve\nHas doc context → retrieve\nOut of scope    → respond"]
+
+    MAIN_AGENT -->|"rag_completed=True\nsmall-talk / out-of-scope"| END_NODE
+    MAIN_AGENT -->|"route = respond / retrieve"| LLM_AGENT["🧠 LLMAgent — Dual Role\n──────────────────────────────────\nMode A Pre-RAG\n  Normalize query → keywords\n\nMode B Direct Reply\n  Conversational answer\n  uses last 6 messages\n\nMode C Post-RAG Synthesis\n  Build Markdown from schemes\n  _localize_text() if non-English"]
+
+    LLM_AGENT -->|"rag_completed=True\ndirect reply done"| END_NODE
+    LLM_AGENT -->|"rag_completed=False\npre-RAG done"| RAG_AGENT["🔍 RAGAgent\n──────────────────────────────\n1. Embed current_query → vector\n2. Qdrant search  top-K = 5\n3. Fallback: SQLite keyword\nsets rag_completed = True"]
+
+    RAG_AGENT -->|"→ post-RAG synthesis"| LLM_AGENT
+```
+
+---
+
+## All 5 Input Types
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant API as FastAPI
+    participant SAR as Sarvam AI
+    participant G as LangGraph
+    participant Q as Qdrant
+
+    Note over U,Q: ① Text only
+    U->>API: POST /chat  {query: "schemes for women"}
+    API->>SAR: translate_text(auto→en-IN)
+    API->>G: invoke(input_type=text)
+    G->>G: Main→retrieve
+    G->>SAR: LLM refine query
+    G->>Q: embed + search
+    G->>SAR: LLM synthesize
+    G-->>API: final_package → U
+
+    Note over U,Q: ② Speech only
+    U->>API: POST /chat  audio.ogg
+    API->>SAR: speech_to_text → transcript + lang
+    API->>SAR: translate(te-IN→en-IN)
+    API->>G: invoke(input_type=audio)
+    G->>SAR: refine → RAG → synthesize
+    G->>SAR: localize(en-IN→te-IN)
+    G-->>API: Telugu answer → U
+
+    Note over U,Q: ③ Document only
+    U->>API: POST /chat  aadhaar.jpg
+    API->>G: invoke(input_type=document)
+    G->>G: DocumentAgent: OCR + field parse
+    G->>G: MainAgent: doc context → retrieve
+    G->>SAR: refine → RAG → synthesize
+    G-->>API: final_package → U
+
+    Note over U,Q: ④ Text + Document
+    U->>API: POST /chat  query + file
+    API->>SAR: translate query
+    API->>G: invoke(input_type=document + raw_query)
+    G->>G: DocumentAgent + MainAgent + RAG
+    G-->>API: final_package → U
+
+    Note over U,Q: ⑤ WhatsApp (any type)
+    U->>API: POST /webhook/twilio
+    API-->>U: TwiML 200 ack immediately
+    API->>SAR: same parse pipeline
+    API->>G: invoke(same state)
+    G->>SAR: same agent flow
+    API->>SAR: send_proactive_message()
+    SAR-->>U: WhatsApp message
+```
+
+---
+
+## Data Ingestion Pipeline
+
+```mermaid
+flowchart LR
+    TRIGGER["POST /scrape"] --> BG["subprocess.Popen\nlog streaming back\nto uvicorn"]
+    BG --> PLAY["Playwright Chromium"]
+    PLAY --> SITES["myscheme.gov.in\n5 categories"]
+    SITES --> SCRAPE["scrape_scheme()\nper URL"]
+    SCRAPE --> JSON["scheme.json"]
+    JSON --> S1["① SQLite\ninsert_scheme()"]
+    S1 --> S2["② Qdrant\nBGE embed + upsert"]
+    S2 --> DONE["Indexed ✓"]
+```
+
+---
+
+## Storage Summary
+
+| Store | Type | Contents | Used by |
+|---|---|---|---|
+| `schemes.db` | SQLite | Scheme name · category · eligibility · benefits · link | RAGAgent fallback · scraper |
+| `chat_history.db` | SQLite | Session ID · title · messages JSON | `/api/sessions` CRUD |
+| Qdrant `schemes` | Vector DB | BGE-small embeddings + scheme payloads | RAGAgent primary search |
+| `temp_uploads/` | Filesystem | Audio · image · PDF (deleted after request) | DocumentAgent · STT |
+| `MemorySaver` | In-memory | LangGraph checkpoint per thread_id = session_id | All agents — conversation memory |
+
+---
+
+## Language Handling Pipeline
+
+```mermaid
+flowchart LR
+    INPUT["User input\nany language"] --> DETECT["Sarvam translate\nsource_language_code=auto\nnormalize_language_code()"]
+    DETECT --> STORE["response_language_code\nstored in AgentState"]
+    STORE --> LLM_WRITE["LLM writes answer\nin target language\ne.g. Tamil"]
+    LLM_WRITE --> CHECK["_is_mostly_latin()\nDid LLM comply?"]
+    CHECK -->|"No — LLM wrote in target lang"| OUT["✅ Use directly"]
+    CHECK -->|"Yes — LLM wrote English anyway"| TRANSLATE["_localize_text()\nchunked translation\n1500 chars per chunk\nSarvam mayura:v1"]
+    TRANSLATE --> OUT
+```

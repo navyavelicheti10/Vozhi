@@ -36,6 +36,20 @@ SUPPORTED_TTS_LANGUAGE_CODES = {
     "od-IN",
 }
 
+# Maps short/ISO-639-1 codes and BCP-47 variants that Sarvam API may return
+# to the expected "xx-IN" format used internally.
+_LANGUAGE_CODE_ALIASES: dict[str, str] = {
+    "en": "en-IN", "hi": "hi-IN", "bn": "bn-IN",
+    "ta": "ta-IN", "te": "te-IN", "kn": "kn-IN",
+    "ml": "ml-IN", "mr": "mr-IN", "gu": "gu-IN",
+    "pa": "pa-IN", "od": "od-IN", "or": "od-IN",
+    # ISO-639-2 codes
+    "tam": "ta-IN", "tel": "te-IN", "kan": "kn-IN",
+    "mal": "ml-IN", "mar": "mr-IN", "guj": "gu-IN",
+    "pan": "pa-IN", "ori": "od-IN", "hin": "hi-IN",
+    "ben": "bn-IN", "eng": "en-IN",
+}
+
 class SarvamAIClient:
     """Wrapper for Sarvam AI chat, speech, translation, and TTS APIs."""
     
@@ -74,7 +88,24 @@ class SarvamAIClient:
 
     def normalize_language_code(self, language_code: str | None) -> str:
         code = (language_code or "").strip()
-        return code if code in SUPPORTED_TTS_LANGUAGE_CODES else "en-IN"
+        if not code:
+            return "en-IN"
+        # Exact match
+        if code in SUPPORTED_TTS_LANGUAGE_CODES:
+            return code
+        # Try full alias lookup first (e.g. "tel", "ta", "pa")
+        alias = _LANGUAGE_CODE_ALIASES.get(code)
+        if alias:
+            logger.debug("Normalized language code '%s' → '%s' via alias", code, alias)
+            return alias
+        # Try the primary subtag prefix (e.g. "te-Telu" → "te" → "te-IN")
+        prefix = code.split("-")[0].lower()
+        alias = _LANGUAGE_CODE_ALIASES.get(prefix)
+        if alias:
+            logger.debug("Normalized language code '%s' → '%s' via prefix '%s'", code, alias, prefix)
+            return alias
+        logger.warning("Unknown language code '%s', falling back to en-IN", code)
+        return "en-IN"
 
     def _split_tts_segments(self, text: str, max_chars: int = 500) -> list[str]:
         normalized_text = re.sub(r"\s+", " ", (text or "").strip())

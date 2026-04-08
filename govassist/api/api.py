@@ -138,9 +138,9 @@ def _build_state(
         "response_language_code": response_language_code,
         "user_profile": {},
         "documents_extracted": {},
+        "route": "",
         "retrieved_schemes": [],
         "synergy_schemes": [],
-        "route": "",
         "rag_completed": False,
         "final_package": "",
         "confidence_score": 0.0,
@@ -528,99 +528,206 @@ def scrape(background_tasks: BackgroundTasks, ingest_after_scrape: bool = True):
     }
 
 
-async def process_twilio_message_bg(msg_data: dict):
+async def _parse_twilio_to_chat_request(msg_data: dict) -> ParsedChatRequest:
+    """Convert a parsed Twilio message dict into a ParsedChatRequest using the
+    exact same logic as _parse_chat_request, so WhatsApp and web share one pipeline."""
     from govassist.integrations.twilio import twilio_client
-    
-    session_id = msg_data.get("from", "default")
-    user_number = msg_data.get("from", "")
-    text = msg_data.get("body", "").strip()
-    media_url = msg_data.get("media_url", "")
-    media_type = msg_data.get("media_type", "")
-    
-    input_type = "text"
-    query_text = text
-    uploaded_file_path = None
-    transcribed_text = ""
-    query_language_code = "en-IN"
-    response_language_code = "en-IN"
-    raw_query = text
+
+    session_id   = msg_data.get("from", "default")
+    text         = (msg_data.get("body") or "").strip()
+    media_url    = msg_data.get("media_url", "")
+    media_type   = (msg_data.get("media_type") or "").lower()
+
+    input_type               = "text"
+    query_text               = text
+    raw_query                = text
+    transcribed_text         = ""
+    query_language_code      = "en-IN"
+    response_language_code   = "en-IN"
+    uploaded_document_path: Path | None = None
+    uploaded_audio_path:    Path | None = None
+    uploaded_file_path:     Path | None = None
+    uploaded_document_name  = ""
+
+    # ── 1. Download media if present ────────────────────────────────────────
+    if media_url:
+        _ensure_temp_dir()
+        # Derive a file extension from the content-type so OCR/PDF routing works correctly
+        ext = (
+            ".pdf"  if media_type == "application/pdf" else
+            ".jpg"  if "jpeg" in media_type else
+            ".png"  if "png"  in media_type else
+            ".webp" if "webp" in media_type else
+            ".ogg"  if "ogg"  in media_type else
+            ".mp3"  if "mp3"  in media_type else
+            ".wav"  if "wav"  in media_type else
+            ".m4a"  if "m4a"  in media_type else
+            ""
+        )
+        safe_id  = session_id.replace("+", "").replace(":", "")
+        filename = f"{safe_id}_twilio_media{ext}"
+        save_path = str(TEMP_DIR / filename)
+
+        dl_path = twilio_client.download_media(media_url, save_path)
+        logger.info("[TWILIO] Downloaded media → %s (type=%s)", dl_path, media_type)
+
+        if dl_path:
+            dl_file = Path(dl_path)
+            if media_type.startswith("audio/"):
+                # ── Audio: STT → translate → treat like /chat audio upload ──
+                uploaded_audio_path = dl_file
+                uploaded_file_path  = dl_file
+                input_type          = "audio"
+
+                stt_payload      = sarvam_client.speech_to_text_with_metadata(dl_path)
+                transcribed_text = stt_payload.get("transcript", "").strip()
+                if not transcribed_text:
+                    raise HTTPException(status_code=502, detail="Audio transcription failed.")
+
+                query_language_code    = stt_payload.get("language_code", "en-IN")
+                response_language_code = query_language_code
+                raw_query              = _combine_query_inputs(text, transcribed_text)
+
+                if query_language_code != "en-IN":
+                    translated   = sarvam_client.translate_text(
+                        text=transcribed_text,
+                        source_language_code=query_language_code,
+                        target_language_code="en-IN",
+                    )
+                    translated_stt = translated.get("translated_text", transcribed_text).strip() or transcribed_text
+                else:
+                    translated_stt = transcribed_text
+
+                query_text = _combine_query_inputs(text, translated_stt)
+
+            elif media_type.startswith("image/") or media_type == "application/pdf":
+                # ── Image/PDF: treat like /chat document upload ───────────────
+                uploaded_document_path = dl_file
+                uploaded_document_name = dl_file.name
+                uploaded_file_path     = dl_file
+                input_type             = "document"
+                query_text             = text  # any caption the user typed
+
+            else:
+                logger.warning("[TWILIO] Unsupported media type '%s'; treating as text", media_type)
+
+    # ── 2. Translate text query (same as _parse_chat_request) ───────────────
+    if not media_url and query_text:
+        translated = sarvam_client.translate_text(
+            text=query_text,
+            source_language_code="auto",
+            target_language_code="en-IN",
+        )
+        query_language_code    = translated.get("source_language_code", "en-IN")
+        response_language_code = query_language_code
+        if query_language_code != "en-IN":
+            query_text = translated.get("translated_text", query_text).strip() or query_text
+
+    logger.info(
+        "[TWILIO] Parsed request — session=%s input_type=%s lang=%s",
+        session_id, input_type, response_language_code,
+    )
+
+    return ParsedChatRequest(
+        session_id=session_id,
+        input_type=input_type,
+        query_text=query_text,
+        raw_query=raw_query,
+        transcribed_text=transcribed_text,
+        uploaded_document_path=uploaded_document_path,
+        uploaded_audio_path=uploaded_audio_path,
+        uploaded_document_name=uploaded_document_name,
+        query_language_code=query_language_code,
+        response_language_code=response_language_code,
+    )
+
+
+async def _process_twilio_message_bg(msg_data: dict) -> None:
+    """Background task: runs the full GovAssist pipeline for a WhatsApp message.
+    Uses the exact same orchestration path as POST /chat.
+    """
+    from govassist.integrations.twilio import twilio_client
+
+    user_number   = msg_data.get("from", "")
+    parsed_request: ParsedChatRequest | None = None
 
     try:
-        if media_url:
-            _ensure_temp_dir()
-            filename = f"{session_id.replace('+', '')}_twilio_media"
-            save_path = str(TEMP_DIR / filename)
-            dl_path = twilio_client.download_media(media_url, save_path)
-            
-            if dl_path:
-                uploaded_file_path = Path(dl_path)
-                if media_type.startswith("audio/"):
-                    input_type = "audio"
-                    stt_payload = sarvam_client.speech_to_text_with_metadata(dl_path)
-                    transcribed_text = stt_payload.get("transcript", "").strip()
-                    if not transcribed_text:
-                        twilio_client.send_proactive_message(user_number, "Audio transcription failed.")
-                        return
-                    query_language_code = stt_payload.get("language_code", "en-IN")
-                    response_language_code = query_language_code
-                    raw_query = transcribed_text
-                    
-                    if query_language_code != "en-IN":
-                        translated = sarvam_client.translate_text(
-                            text=transcribed_text,
-                            source_language_code=query_language_code,
-                            target_language_code="en-IN",
-                        )
-                        query_text = translated.get("translated_text", transcribed_text).strip() or transcribed_text
-                    else:
-                        query_text = transcribed_text
-                elif media_type.startswith("image/"):
-                    input_type = "document"
-                    query_text = text
-        elif query_text:
-            translated = sarvam_client.translate_text(
-                text=query_text,
-                source_language_code="auto",
-                target_language_code="en-IN",
-            )
-            query_language_code = translated.get("source_language_code", "en-IN")
-            response_language_code = query_language_code
-            if query_language_code != "en-IN":
-                query_text = translated.get("translated_text", query_text).strip() or query_text
+        logger.info("[TWILIO] Processing message from %s", user_number)
 
+        # ── Step 1: Parse (same helpers as web /chat) ────────────────────────
+        parsed_request = await _parse_twilio_to_chat_request(msg_data)
+
+        # ── Step 2: Build LangGraph state (identical to web chat) ────────────
         state = _build_state(
-            input_type=input_type,
-            query_text=query_text,
-            session_id=session_id,
-            uploaded_file_path=uploaded_file_path,
-            transcribed_text=transcribed_text,
-            raw_query=raw_query,
-            query_language_code=query_language_code,
-            response_language_code=response_language_code,
+            input_type=parsed_request.input_type,
+            query_text=parsed_request.query_text,
+            session_id=parsed_request.session_id,
+            uploaded_file_path=parsed_request.uploaded_document_path,
+            transcribed_text=parsed_request.transcribed_text,
+            raw_query=parsed_request.raw_query,
+            query_language_code=parsed_request.query_language_code,
+            response_language_code=parsed_request.response_language_code,
         )
-        config = {"configurable": {"thread_id": session_id}}
+
+        # ── Step 3: Run LangGraph agents (identical to web chat) ─────────────
+        config       = {"configurable": {"thread_id": parsed_request.session_id}}
+        logger.info("[TWILIO] Invoking govassist_graph for session=%s", parsed_request.session_id)
         result_state = await asyncio.to_thread(govassist_graph.invoke, state, config)
-        
-        final_payload = _format_chat_response(session_id, result_state)
-        answer = final_payload.get("answer", "")
-        
+
+        # ── Step 4: Format response (identical to web chat) ──────────────────
+        final_payload = _format_chat_response(parsed_request.session_id, result_state)
+        answer        = final_payload.get("answer", "").strip()
+
+        if not answer:
+            answer = "I could not find a matching scheme. Please try a different query."
+
+        logger.info(
+            "[TWILIO] Response ready for %s — %d chars, confidence=%.2f",
+            user_number, len(answer), final_payload.get("confidence", 0.0),
+        )
+
+        # ── Step 5: Send WhatsApp reply ───────────────────────────────────────
         twilio_client.send_proactive_message(user_number, answer)
 
-    except Exception as exc:
-        logger.exception("Twilio background processing failed")
-        twilio_client.send_proactive_message(user_number, "Sorry, I am having trouble connecting to the Vozhi Orchestrator right now.")
+    except HTTPException as exc:
+        logger.warning("[TWILIO] Chat parsing rejected for %s: %s", user_number, exc.detail)
+        twilio_client.send_proactive_message(
+            user_number,
+            f"Sorry, I couldn't process your message: {exc.detail}"
+        )
+    except Exception:
+        logger.exception("[TWILIO] Pipeline failed for %s", user_number)
+        twilio_client.send_proactive_message(
+            user_number,
+            "Sorry, I am having trouble connecting to the Vozhi Orchestrator right now. Please try again.",
+        )
     finally:
-        if uploaded_file_path and uploaded_file_path.exists():
-            uploaded_file_path.unlink(missing_ok=True)
+        # Clean up temp files exactly as the web chat endpoint does
+        if parsed_request:
+            for temp_path in (parsed_request.uploaded_document_path, parsed_request.uploaded_audio_path):
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                    logger.debug("[TWILIO] Cleaned up temp file: %s", temp_path)
 
 
 @app.post("/webhook/twilio")
 async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Twilio WhatsApp webhook.
+    Returns an empty TwiML immediately (Twilio's 15-second timeout),
+    then processes the full GovAssist pipeline in the background.
+    """
     from govassist.integrations.twilio import twilio_client
-    form = await request.form()
+
+    form     = await request.form()
     msg_data = twilio_client.parse_incoming_message(dict(form))
 
+    logger.info(
+        "[TWILIO] Webhook received — from=%s has_media=%s",
+        msg_data.get("from"), bool(msg_data.get("media_url")),
+    )
+
+    # Acknowledge immediately so Twilio doesn't time out
     fast_twiml = twilio_client.generate_twiml_response("")
-    background_tasks.add_task(process_twilio_message_bg, msg_data)
+    background_tasks.add_task(_process_twilio_message_bg, msg_data)
 
     return Response(content=fast_twiml, media_type="application/xml")

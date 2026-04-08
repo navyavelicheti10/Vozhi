@@ -87,17 +87,57 @@ def _build_small_talk_response(query: str) -> str:
     return "Hello. I can help you find relevant government schemes, check eligibility, or review uploaded documents."
 
 
+def _is_mostly_latin(text: str, threshold: float = 0.80) -> bool:
+    """Return True if the text is predominantly Latin/ASCII characters.
+    Used to detect whether an LLM ignored a non-English language instruction.
+    """
+    if not text:
+        return True
+    # Count printable non-whitespace characters
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return True
+    latin = sum(1 for c in chars if ord(c) < 256)
+    return (latin / len(chars)) > threshold
+
+
 def _localize_text(text: str, state: AgentState) -> str:
     target_language = state.get("response_language_code", "en-IN")
     if not text or target_language == "en-IN":
         return text
 
-    translated = sarvam_client.translate_text(
-        text=text,
-        source_language_code="en-IN",
-        target_language_code=target_language,
-    )
-    return translated.get("translated_text", text).strip() or text
+    # Split long texts into paragraph chunks to respect Sarvam's ~2000-char limit.
+    MAX_CHUNK = 1500
+    paragraphs = text.split("\n")
+    chunks: list[str] = []
+    current = ""
+    for para in paragraphs:
+        candidate = f"{current}\n{para}" if current else para
+        if len(candidate) <= MAX_CHUNK:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            # If a single paragraph is itself too long, hard-split it
+            if len(para) > MAX_CHUNK:
+                for i in range(0, len(para), MAX_CHUNK):
+                    chunks.append(para[i:i + MAX_CHUNK])
+                current = ""
+            else:
+                current = para
+    if current:
+        chunks.append(current)
+
+    translated_parts: list[str] = []
+    for chunk in chunks:
+        result = sarvam_client.translate_text(
+            text=chunk,
+            source_language_code="en-IN",
+            target_language_code=target_language,
+        )
+        translated_parts.append(result.get("translated_text", chunk).strip() or chunk)
+
+    return "\n".join(translated_parts)
 
 
 def _is_assistant_meta_query(query: str) -> bool:
@@ -174,6 +214,15 @@ def _ensure_llm() -> None:
     load_env_file()
 
 
+def _strip_thinking_tags(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks that reasoning models emit."""
+    if not text:
+        return text
+    # Strip everything between <think> and </think> (including the tags), non-greedy
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
 def _invoke_llm(
     messages: List[SystemMessage | HumanMessage],
     temperature: float = 0.2,
@@ -181,15 +230,35 @@ def _invoke_llm(
 ) -> str:
     payload = []
     for message in messages:
-        role = "system"
-        if isinstance(message, HumanMessage):
+        if isinstance(message, SystemMessage):
+            role = "system"
+        elif isinstance(message, HumanMessage):
             role = "user"
-        payload.append({"role": role, "content": str(message.content)})
-    return sarvam_client.chat_completion(
+        else:
+            # AIMessage and any other type → assistant
+            role = "assistant"
+        content = _strip_thinking_tags(str(message.content))
+        if content:
+            payload.append({"role": role, "content": content})
+
+    # Sarvam constraint: system message must appear exactly once, at index 0.
+    # Re-order to guarantee that invariant even if history is messy.
+    system_msgs = [m for m in payload if m["role"] == "system"]
+    other_msgs  = [m for m in payload if m["role"] != "system"]
+    if len(system_msgs) > 1:
+        logger.warning("_invoke_llm: found %d system messages, collapsing to one", len(system_msgs))
+        system_msgs = [system_msgs[0]]
+    payload = system_msgs + other_msgs
+
+    if not payload:
+        return ""
+
+    raw = sarvam_client.chat_completion(
         messages=payload,
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    return _strip_thinking_tags(raw)
 
 
 def _ensure_rag_clients() -> None:
@@ -287,6 +356,57 @@ def _calculate_confidence(schemes: List[Dict[str, Any]]) -> float:
     return round(min(max(average_score, 0.0), 1.0), 3)
 
 
+def _looks_like_internal_search_analysis(text: str) -> bool:
+    normalized = clean_text(text).lower()
+    if not normalized:
+        return False
+    markers = (
+        "semantic search keywords",
+        "search keywords",
+        "rationale:",
+        "exclusions:",
+        "state-agnostic eligibility",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _build_user_facing_scheme_summary(state: AgentState, schemes: List[Dict[str, Any]]) -> str:
+    if not schemes:
+        return ""
+
+    top_scheme = schemes[0]
+    top_name = clean_text(top_scheme.get("scheme_name", "this scheme"))
+    benefits = clean_text(top_scheme.get("benefits", ""))
+    eligibility = clean_text(top_scheme.get("eligibility", ""))
+    documents_extracted = state.get("documents_extracted") or {}
+    structured_fields = documents_extracted.get("structured_fields") or {}
+    person_name = clean_text(structured_fields.get("name", ""))
+
+    opening = (
+        f"For {person_name}, the closest match I found is **{top_name}**."
+        if person_name
+        else f"The closest match I found is **{top_name}**."
+    )
+
+    lines = [opening]
+    if eligibility:
+        lines.append(f"Eligibility: {eligibility[:220]}.")
+    if benefits:
+        lines.append(f"Benefits: {benefits[:220]}.")
+
+    if len(schemes) > 1:
+        also_consider = ", ".join(
+            f"**{clean_text(scheme.get('scheme_name', 'Unknown Scheme'))}**"
+            for scheme in schemes[1:3]
+            if clean_text(scheme.get("scheme_name", ""))
+        )
+        if also_consider:
+            lines.append(f"Also consider {also_consider}.")
+
+    lines.append("Use the official links below to verify eligibility and apply.")
+    return "\n\n".join(lines)
+
+
 def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMessage]:
     schemes = state.get("retrieved_schemes", [])
     synergies = state.get("synergy_schemes", [])
@@ -323,6 +443,7 @@ def _build_post_rag_messages(state: AgentState) -> List[SystemMessage | HumanMes
         "- Use plain language and short bullets under sections when useful.\n"
         "- Add inline citations in this exact format: [Source: Scheme Name].\n"
         "- If retrieval is weak or partial, say so briefly instead of filling gaps.\n"
+        "- Never mention internal search analysis, semantic keywords, rationale, exclusions, or retrieval planning.\n"
         "- Do not output JSON.\n"
         f"- Write the final answer entirely in {response_language}."
     )
@@ -395,6 +516,25 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
             fallback_lines.append(f"- **{name}**: {scheme.get('description', '')[:200]}...")
         content = "\n".join(fallback_lines)
 
+    # Fallback: if the LLM ignored the language instruction and replied in English,
+    # force-translate via Sarvam translate API.
+    response_language_code = state.get("response_language_code", "en-IN")
+    if response_language_code and response_language_code != "en-IN":
+        if _is_mostly_latin(content):
+            logger.info(
+                "LLM responded in English despite target=%s — applying Sarvam translation",
+                response_language_code,
+            )
+            content = _localize_text(content, state)
+        else:
+            logger.info("LLM correctly responded in target language %s", response_language_code)
+
+    if _looks_like_internal_search_analysis(content):
+        logger.warning("Post-RAG synthesis leaked internal search-analysis text. Replacing with user-facing summary.")
+        content = _build_user_facing_scheme_summary(state, schemes)
+        if response_language_code and response_language_code != "en-IN":
+            content = _localize_text(content, state)
+
     citations = [
         scheme.get("scheme_name")
         for scheme in schemes
@@ -411,16 +551,37 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
 
 
 def main_agent(state: AgentState) -> Dict[str, Any]:
-    """Primary router that decides whether to answer directly or run RAG."""
+    """Primary router / planner — always the first node in the graph.
+
+    Decision order:
+    1. Document input with no extraction yet  → dispatch to DocumentAgent
+    2. Empty query + no document context      → prompt user
+    3. Small talk / greeting                  → direct reply (no RAG)
+    4. Assistant meta query                   → direct reply via LLMAgent
+    5. Has document context OR scheme keyword → RAG retrieve path
+    6. Out of scope                           → direct reply (no RAG)
+    """
     _ensure_llm()
 
+    input_type = state.get("input_type", "text")
+    documents_extracted = state.get("documents_extracted") or {}
+    has_document_extracted = bool(documents_extracted.get("raw_text"))
+
+    # ── 1. Document input — extract first, then come back ──────────────────
+    if input_type == "document" and not has_document_extracted:
+        logger.info("[MAIN] Document input detected, no extraction yet → dispatching to DocumentAgent")
+        return {"route": "document"}
+
     seed_query = clean_text(_seed_query_from_state(state))
-    has_document_context = bool((state.get("documents_extracted") or {}).get("raw_text"))
+    has_document_context = has_document_extracted
+
+    # ── 2. Empty query with no document context ─────────────────────────────
     if not seed_query:
         if has_document_context:
+            logger.info("[MAIN] No query but document context present → retrieve")
             return {"route": "retrieve"}
         reply = _localize_text(
-            "Tell me what you need, and I’ll help. If you're looking for a government scheme, share your state or purpose.",
+            "Tell me what you need, and I'll help. If you're looking for a government scheme, share your state or purpose.",
             state,
         )
         return {
@@ -434,7 +595,9 @@ def main_agent(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content=reply)],
         }
 
+    # ── 3. Small talk ────────────────────────────────────────────────────────
     if _is_small_talk(seed_query):
+        logger.info("[MAIN] Small talk detected → direct respond (no RAG)")
         reply = _localize_text(_build_small_talk_response(seed_query), state)
         return {
             "route": "respond",
@@ -447,15 +610,22 @@ def main_agent(state: AgentState) -> Dict[str, Any]:
             "messages": [AIMessage(content=reply)],
         }
 
+    # ── 4. Assistant meta query (who are you / what can you do) ─────────────
     if _is_assistant_meta_query(seed_query):
+        logger.info("[MAIN] Meta query → LLMAgent direct respond")
         return {"route": "respond"}
 
+    # ── 5. Document context present OR scheme keyword → RAG ─────────────────
     if has_document_context:
+        logger.info("[MAIN] Document context → retrieve")
         return {"route": "retrieve", "current_query": seed_query}
 
     if _looks_like_scheme_query(seed_query):
+        logger.info("[MAIN] Scheme query detected → retrieve")
         return {"route": "retrieve"}
 
+    # ── 6. Out of scope ──────────────────────────────────────────────────────
+    logger.info("[MAIN] Out of scope → direct respond (no RAG)")
     reply = _localize_text(_build_out_of_scope_response(), state)
     return {
         "route": "respond",
@@ -467,6 +637,57 @@ def main_agent(state: AgentState) -> Dict[str, Any]:
         "rag_completed": True,
         "messages": [AIMessage(content=reply)],
     }
+
+
+def _extract_keywords_only(text: str) -> str:
+    """Strip any section headers, rationale blocks, and markdown from an LLM
+    response that was supposed to return only keywords.
+
+    Handles patterns like:
+      '**Semantic Search Keywords:** foo, bar'
+      'Keywords: foo bar\nRationale: ...'
+      '- foo\n- bar'
+    """
+    if not text:
+        return text
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    # 1. If there is an explicit "keyword" header line, extract content after ":"
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if "keyword" in lower and ":" in line:
+            after_colon = re.sub(r"\*+", "", line.split(":", 1)[1]).strip()
+            if after_colon:
+                return after_colon
+            # keyword content may be on the next line
+            for j in range(i + 1, min(i + 3, len(lines))):
+                candidate = re.sub(r"\*+", "", lines[j]).strip()
+                if candidate and "rationale" not in candidate.lower():
+                    return candidate
+
+    # 2. Truncate at "Rationale:" if present and use what came before
+    rationale_idx = None
+    for i, line in enumerate(lines):
+        if "rationale" in line.lower() and ":" in line:
+            rationale_idx = i
+            break
+    if rationale_idx is not None and rationale_idx > 0:
+        lines = lines[:rationale_idx]
+
+    # 3. Strip markdown: bold markers, bullet prefixes, numbered list prefixes
+    cleaned_lines = []
+    for line in lines:
+        line = re.sub(r"\*+", "", line)          # remove bold/italic markers
+        line = re.sub(r"^[-•*]\s+", "", line)    # remove bullet points
+        line = re.sub(r"^\d+\.\s+", "", line)    # remove numbered lists
+        line = re.sub(r"^#+\s+", "", line)       # remove markdown headings
+        line = line.strip()
+        if line:
+            cleaned_lines.append(line)
+
+    result = " ".join(cleaned_lines).strip()
+    return result or text
 
 
 def _pre_rag_query_refinement(state: AgentState) -> Dict[str, Any]:
@@ -481,35 +702,46 @@ def _pre_rag_query_refinement(state: AgentState) -> Dict[str, Any]:
     if not seed_query:
         seed_query = "Find relevant government schemes using the uploaded document details."
 
+    # Strict few-shot prompt — concrete examples of correct vs wrong output
     prompt = (
-        "You normalize conversational queries into semantic search keywords for a Vector Database.\n"
-        "Return only a short, generic string of keywords (DO NOT write SQL, JSON, or code).\n"
-        "Preserve important facts such as state, demographics, document hints, and benefit intent.\n"
-        "Do not add explanations or formatting."
+        "You are a search keyword extractor for a government scheme database.\n"
+        "OUTPUT ONLY a short comma-separated list of search keywords. Nothing else.\n"
+        "No headers, no sections, no rationale, no bullet points, no markdown, no explanations.\n\n"
+        "CORRECT examples:\n"
+        "  Input: 'schemes for a 38-year-old male from Karnataka'\n"
+        "  Output: male age 38 Karnataka government scheme eligibility\n\n"
+        "  Input: 'Aadhaar document for Dhinakaran, suggest schemes'\n"
+        "  Output: Dhinakaran male adult financial inclusion self-employment pension skill\n\n"
+        "WRONG (never do this):\n"
+        "  **Semantic Search Keywords:** ...\n"
+        "  Rationale: ...\n\n"
+        "Preserve: state, gender, age, income, occupation, benefit intent from the query."
     )
-    
+
     chat_history = state.get("messages", [])
     history_str = ""
     if len(chat_history) > 1:
         history_str = "Conversation History:\n" + "\n".join(
-            f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}" 
+            f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {_strip_thinking_tags(str(m.content))[:300]}"
             for m in chat_history[-5:-1]
         ) + "\n\n"
-        
+
     human_content = seed_query if not document_context else f"{seed_query}\n\n{document_context}"
     human_content = history_str + f"Latest User Query: {human_content}"
 
     try:
-        normalized_query = clean_text(
+        raw_output = clean_text(
             _invoke_llm(
                 [
                     SystemMessage(content=prompt),
                     HumanMessage(content=human_content),
                 ],
-                temperature=0.1,
-                max_tokens=220,
+                temperature=0.0,
+                max_tokens=80,
             )
         ).strip("\"'")
+        normalized_query = _extract_keywords_only(raw_output)
+        logger.info("[REFINE] Seed: %r  →  Keywords: %r", seed_query[:80], normalized_query[:80])
     except Exception as exc:
         logger.warning("Sarvam query refinement failed, falling back to original query: %s", exc)
         normalized_query = seed_query

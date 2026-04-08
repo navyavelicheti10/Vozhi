@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
@@ -65,10 +66,8 @@ interface ChatSession {
 }
 
 const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/$/, "");
-const WHATSAPP_JOIN_CODE =
-  process.env.NEXT_PUBLIC_WHATSAPP_JOIN_CODE || "configured by your deployment";
-const WHATSAPP_NUMBER =
-  process.env.NEXT_PUBLIC_WHATSAPP_NUMBER || "configured by your deployment";
+const WHATSAPP_JOIN_CODE = "join grandfather-held";
+const WHATSAPP_NUMBER = "+14155238886";
 const INITIAL_ASSISTANT_MESSAGE =
   "Namaskaram! I am Vozhi, India’s Intelligent Benefits Orchestrator. How can I help you discover and unlock government schemes today?";
 
@@ -929,35 +928,70 @@ export default function VozhiApp() {
       </main>
 
       <Dialog open={showWhatsApp} onOpenChange={setShowWhatsApp}>
-        <DialogContent className="max-w-md dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100">
+        <DialogContent className="max-w-sm overflow-hidden border-zinc-200 bg-white p-0 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100">
           <DialogHeader>
-            <DialogTitle>Try Vozhi on WhatsApp</DialogTitle>
-            <DialogDescription>
-              Experience the power of Vozhi through Twilio WhatsApp. You can send voice
-              notes or text anywhere in India.
-            </DialogDescription>
+            <div className="border-b border-zinc-200 bg-gradient-to-r from-emerald-50 via-white to-zinc-50 px-5 py-4 dark:border-zinc-800 dark:from-emerald-950/40 dark:via-zinc-900 dark:to-zinc-900">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-emerald-600 text-white shadow-sm shadow-emerald-600/20">
+                  <Share2 className="h-5 w-5" />
+                </div>
+                <div>
+                  <DialogTitle className="text-left text-lg font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
+                    Try Vozhi on WhatsApp
+                  </DialogTitle>
+                  <DialogDescription className="mt-1 text-left text-sm leading-relaxed text-zinc-600 dark:text-zinc-300">
+                    Scan the QR or send the code below.
+                  </DialogDescription>
+                </div>
+              </div>
+            </div>
           </DialogHeader>
-          <div className="mt-4 space-y-3 rounded-xl bg-zinc-100 p-4 dark:bg-zinc-800">
-            <p className="text-sm text-zinc-700 dark:text-zinc-200">
-              1. Open your WhatsApp application.
-            </p>
-            <p className="text-sm text-zinc-700 dark:text-zinc-200">
-              2. Send{" "}
-              <span className="select-all rounded bg-zinc-200 px-1 py-0.5 font-mono text-xs dark:bg-zinc-700">
-                {WHATSAPP_JOIN_CODE}
-              </span>{" "}
-              to{" "}
-              <span className="rounded bg-zinc-200 px-1 py-0.5 font-mono text-xs dark:bg-zinc-700">
-                {WHATSAPP_NUMBER}
-              </span>
-            </p>
-            <p className="text-sm text-zinc-700 dark:text-zinc-200">
-              3. Ask a question like{" "}
-              <em>&quot;I am a farmer from Bengal, what schemes am I eligible for?&quot;</em>
-            </p>
+          <div className="space-y-4 px-5 py-5">
+            <div className="mx-auto w-fit rounded-3xl border border-emerald-100 bg-gradient-to-b from-white to-emerald-50 p-3 shadow-sm dark:border-emerald-900/60 dark:from-zinc-950 dark:to-emerald-950/20">
+              <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-50">
+                <Image
+                  src="/whatsapp-qr.svg"
+                  alt="WhatsApp QR code for joining Vozhi"
+                  width={180}
+                  height={180}
+                  className="h-[180px] w-[180px]"
+                  priority
+                />
+              </div>
+              <p className="mt-2 text-center text-[11px] font-medium uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-300">
+                Scan To Join
+              </p>
+            </div>
+
+            <div className="grid gap-3">
+              <div className="rounded-2xl border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950/60">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-500 dark:text-zinc-400">
+                  WhatsApp Number
+                </p>
+                <p className="mt-1 select-all font-mono text-sm text-zinc-900 dark:text-zinc-100">
+                  {WHATSAPP_NUMBER}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900/70 dark:bg-emerald-950/20">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-emerald-700 dark:text-emerald-300">
+                  Join Code
+                </p>
+                <p className="mt-1 select-all font-mono text-sm text-emerald-900 dark:text-emerald-100">
+                  {WHATSAPP_JOIN_CODE}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-zinc-200 bg-zinc-50 p-3 text-sm leading-relaxed text-zinc-600 dark:border-zinc-800 dark:bg-zinc-950/60 dark:text-zinc-300">
+                Scan the QR or send the join code, then start chatting with Vozhi.
+              </div>
+            </div>
           </div>
-          <div className="mt-4 flex justify-end">
-            <Button onClick={() => setShowWhatsApp(false)}>Done</Button>
+          <div className="flex justify-end border-t border-zinc-200 px-5 py-3 dark:border-zinc-800">
+            <Button
+              onClick={() => setShowWhatsApp(false)}
+              className="bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            >
+              Done
+            </Button>
           </div>
         </DialogContent>
       </Dialog>

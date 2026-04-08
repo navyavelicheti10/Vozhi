@@ -10,24 +10,26 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], add_messages]
 
     # Input definition
-    input_type: str
-    transcribed_text: Optional[str]
-    raw_query: Optional[str]
-    current_query: str
-    uploaded_file_path: Optional[str]
-    query_language_code: str
-    response_language_code: str
+    input_type: str                    # text | audio | document
+    transcribed_text: Optional[str]    # STT output (audio inputs)
+    raw_query: Optional[str]           # original user text (pre-translation)
+    current_query: str                 # normalized / translated query for RAG
+    uploaded_file_path: Optional[str]  # temp path to uploaded file
+    query_language_code: str           # detected input language
+    response_language_code: str        # language to respond in
 
     # Agent outputs
-    user_profile: Dict[str, Any]
-    documents_extracted: Dict[str, Any]
-    route: str
+    user_profile: Dict[str, Any]       # extracted profile fields from documents
+    documents_extracted: Dict[str, Any]# OCR + structured fields from uploaded file
+    route: str                         # routing decision: respond | retrieve
+
     # RAG retrievals
-    retrieved_schemes: List[Dict[str, Any]]
-    rag_completed: bool
+    retrieved_schemes: List[Dict[str, Any]]   # top-K schemes from Qdrant / SQLite
+    synergy_schemes: List[Dict[str, Any]]     # complementary / synergy schemes
+    rag_completed: bool                       # True once RAG + synthesis is done
 
     # Final response
-    final_package: str
-    confidence_score: float
-    citations: List[str]
-    sources: List[Dict[str, str]]
+    final_package: str          # markdown answer to the user
+    confidence_score: float     # 0.0 – 1.0 retrieval confidence
+    citations: List[str]        # scheme names cited
+    sources: List[Dict[str, str]]  # [{title, url}] for official links
