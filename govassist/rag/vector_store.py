@@ -15,6 +15,8 @@ from qdrant_client.models import (
 logger = logging.getLogger(__name__)
 
 
+_local_clients = {}
+
 class QdrantManager:
     """Small wrapper around Qdrant for this project."""
 
@@ -31,8 +33,11 @@ class QdrantManager:
         qdrant_api_key = api_key or os.getenv("QDRANT_API_KEY")
 
         if qdrant_mode == "local":
-            logger.info("Using local Qdrant storage at: %s", local_path)
-            self.client = QdrantClient(path=local_path)
+            global _local_clients
+            if local_path not in _local_clients:
+                logger.info("Using local Qdrant storage at: %s", local_path)
+                _local_clients[local_path] = QdrantClient(path=local_path)
+            self.client = _local_clients[local_path]
         else:
             logger.info("Connecting to Qdrant server: %s", qdrant_url)
             self.client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
@@ -105,17 +110,21 @@ class QdrantManager:
                 ]
             )
 
-        response = self.client.query_points(
-            collection_name=self.collection_name,
-            query=query_vector,
-            limit=top_k,
-            query_filter=query_filter,
-            with_payload=True,
-        )
+        try:
+            response = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_vector,
+                limit=top_k,
+                query_filter=query_filter,
+                with_payload=True,
+            )
 
-        formatted = []
-        for item in response.points:
-            payload = dict(item.payload or {})
-            payload["score"] = item.score
-            formatted.append(payload)
-        return formatted
+            formatted = []
+            for item in response.points:
+                payload = dict(item.payload or {})
+                payload["score"] = item.score
+                formatted.append(payload)
+            return formatted
+        except Exception as e:
+            logger.warning(f"Qdrant search failed (Collection might not exist): {e}")
+            return []

@@ -1,1 +1,0 @@
-"""UI entrypoints for GovAssist."""

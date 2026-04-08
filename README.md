@@ -1,224 +1,180 @@
-# GovAssist-RAG: Government Schemes Assistant
+# GovAssist-RAG
 
-A Retrieval-Augmented Generation (RAG) system that helps users find and learn about Indian government schemes. This project scrapes government scheme data, embeds it using sentence transformers, stores it in a vector database (Qdrant), and provides an AI-powered chat interface to answer questions about available schemes.
+GovAssist is a multimodal government-schemes assistant for Indian public-benefit discovery. It combines:
 
-## Features
+- FastAPI for the backend API
+- LangGraph for orchestration
+- Sarvam for query refinement, final answer generation, speech-to-text, translation, and text-to-speech
+- EasyOCR and `pypdf` for document extraction
+- SQLite for scheme storage and chat history
+- Qdrant for vector retrieval
+- Next.js for the active frontend
 
-- **Web Scraping**: Automatically scrapes government scheme data from myscheme.gov.in across multiple categories (Agriculture, Banking, Education, Health, Women & Child)
-- **Vector Search**: Uses sentence-transformers (BGE model) for semantic search of schemes
-- **AI-Powered Responses**: Integrates with Groq's Llama models for natural language answers
-- **Chat Sessions**: Maintains conversation history for contextual follow-up questions
-- **Dual Interface**: 
-  - FastAPI backend for API access
-  - Streamlit web UI for user-friendly interaction
-- **Fallback Search**: Keyword-based search when vector search fails
-- **Tag-Based Filtering**: Auto-detects query categories (student, farmer, women, loan, etc.) for better results
-- **Local Vector Database**: Uses Qdrant for efficient vector storage and retrieval
+## Current Runtime Architecture
 
-## Architecture
+The active request path is:
 
-The system consists of several key components:
+1. User sends text, audio, or a document.
+2. FastAPI builds an `AgentState`.
+3. LangGraph routes through:
+   - document extraction when a document is uploaded
+   - LLM query normalization
+   - RAG retrieval
+   - final LLM answer synthesis
+4. The frontend renders the final answer, with streaming supported for text, audio, and document chat.
 
-- **Scraper (`scrape.py`)**: Uses Playwright to collect scheme data from government websites
-- **Embedding Service (`embed.py`)**: Converts text to vector embeddings using BGE-small-en-v1.5
-- **Vector Database (`qdrant_db.py`)**: Manages Qdrant collections for vector storage and search
-- **LLM Client (`groq_client.py`)**: Handles interactions with Groq API for answer generation
-- **RAG Pipeline (`rag_pipeline.py`)**: Orchestrates the entire retrieval and generation process
-- **Session Management (`checkpointer.py`)**: Stores chat history in JSON files
-- **API Server (`main.py`)**: FastAPI backend providing REST endpoints
-- **Web UI (`streamlit_app.py`)**: Streamlit frontend for user interaction
+Main runtime files:
 
-## Tech Stack
+- [main.py](/home/slakshman2004/GovAssist-RAG/main.py)
+- [govassist/api/api.py](/home/slakshman2004/GovAssist-RAG/govassist/api/api.py)
+- [govassist/agents/graph.py](/home/slakshman2004/GovAssist-RAG/govassist/agents/graph.py)
+- [govassist/agents/nodes.py](/home/slakshman2004/GovAssist-RAG/govassist/agents/nodes.py)
+- [frontend/src/app/page.tsx](/home/slakshman2004/GovAssist-RAG/frontend/src/app/page.tsx)
 
-- **Backend**: Python, FastAPI, Uvicorn
-- **Frontend**: Streamlit
-- **AI/ML**: Sentence Transformers, Groq API (Llama 3.1)
-- **Vector Database**: Qdrant (local or cloud)
-- **Web Scraping**: Playwright
-- **Data Storage**: JSON files for schemes and chat sessions
+## Features Implemented
 
-## Installation
+- Text chat for government-scheme discovery
+- Small-talk handling for greeting, thanks, and goodbye messages
+- Streaming assistant responses
+- Audio upload and in-browser microphone recording
+- Speech-to-text using Sarvam
+- On-demand text-to-speech for assistant responses using Sarvam
+- PDF and image document extraction
+- Semantic retrieval with Qdrant
+- SQLite fallback retrieval when vector search fails
+- Graph-based synergy lookup
+- Chat history persistence in SQLite
+- Scheme ingestion into SQLite and Qdrant
 
-### Prerequisites
+## API
 
-- Python 3.8+
-- Node.js (for Playwright, if scraping)
-- Groq API key
+### Core endpoints
 
-### Setup
+- `GET /`
+  - lightweight API landing page
+- `GET /health`
+  - health check
+- `POST /chat`
+  - blocking chat for text, audio, and document requests
+- `POST /chat/stream`
+  - streamed chat for text, audio, and document requests
+- `POST /tts`
+  - synthesize assistant text to playable audio
+- `GET /api/sessions`
+  - list chat sessions
+- `GET /api/sessions/{session_id}`
+  - fetch one session’s saved messages
+- `POST /api/sessions`
+  - save a session snapshot
+- `DELETE /api/sessions/{session_id}`
+  - delete a session
+- `POST /scrape`
+  - run the scraping pipeline in the background
 
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd GovAssist-RAG
-   ```
+### Input modes
 
-2. **Create virtual environment**:
-   ```bash
-   python -m venv .venv
-   # On Windows:
-   .venv\Scripts\activate
-   # On macOS/Linux:
-   source .venv/bin/activate
-   ```
+- `application/json`
+  - text chat
+- `multipart/form-data`
+  - audio file chat
+  - document chat with optional query text
 
-3. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Frontend
 
-4. **Set up environment variables**:
-   
-   Create a `.env` file in the root directory:
-   ```env
-   GROQ_API_KEY=your_groq_api_key_here
-   LOG_LEVEL=INFO
-   SCHEMES_FILE=scheme.json
-   AUTO_INGEST=true
-   FORCE_RECREATE_COLLECTION=false
-   QDRANT_MODE=local
-   QDRANT_LOCAL_PATH=./qdrant_data
-   API_BASE_URL=http://127.0.0.1:8000
-   ```
+The active frontend is the Next.js app in [frontend/](/home/slakshman2004/GovAssist-RAG/frontend).
 
-   Get your Groq API key from [groq.com](https://groq.com).
+It currently supports:
 
-5. **Scrape scheme data** (optional, if you want fresh data):
-   ```bash
-   python scrape.py
-   ```
-   
-   This will create/update `data/raw/scheme.json` with the latest scheme information.
+- chat session history
+- streamed responses
+- microphone recording in the chat composer
+- document upload in the chat composer
+- theme toggle
+- WhatsApp onboarding modal
 
-## Usage
-
-### Starting the API Server
-
-```bash
-python main.py
-```
-
-The FastAPI server will start on `http://127.0.0.1:8000`.
-
-### Starting the Web UI
+Run it with:
 
 ```bash
-streamlit run streamlit_app.py
+cd frontend
+npm install
+npm run dev
 ```
 
-The Streamlit app will be available at `http://localhost:8501`.
+Optional frontend env:
 
-### API Endpoints
+```env
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_WHATSAPP_NUMBER=+14155238886
+NEXT_PUBLIC_WHATSAPP_JOIN_CODE=join grandfather-held
+```
 
-- `GET /health` - Health check
-- `POST /chat` - Send a query and get AI response
-  - Request body:
-    ```json
-    {
-      "query": "What schemes are available for students?",
-      "top_k": 5,
-      "session_id": "optional-session-id"
-    }
-    ```
-  - Response:
-    ```json
-    {
-      "session_id": "generated-or-provided-session-id",
-      "query": "What schemes are available for students?",
-      "answer": "AI-generated answer...",
-      "matches": [...]
-    }
-    ```
-- `GET /sessions/{session_id}` - Get chat history for a session
+If `NEXT_PUBLIC_API_BASE_URL` is omitted, the frontend uses same-origin relative paths.
 
-### Example Queries
+## Backend Setup
 
-- "What education schemes are available for students?"
-- "Schemes for farmers in agriculture"
-- "Women empowerment programs"
-- "Loan schemes for small businesses"
-- "Health insurance for families"
+Create a `.env` file in the repo root:
 
-## Configuration
+```env
+SARVAM_API_KEY=
+SARVAM_CHAT_MODEL=sarvam-m
+LOG_LEVEL=INFO
+SCHEMES_FILE=scheme.json
+AUTO_INGEST=true
+FORCE_RECREATE_COLLECTION=false
+QDRANT_MODE=local
+QDRANT_LOCAL_PATH=./qdrant_data
+API_BASE_URL=http://127.0.0.1:8000
+CORS_ALLOW_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_WHATSAPP_NUMBER=+14155238886
+NEXT_PUBLIC_WHATSAPP_JOIN_CODE=join grandfather-held
+```
 
-### Environment Variables
+### Required vs optional credentials
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GROQ_API_KEY` | - | Required. Your Groq API key |
-| `GROQ_MODEL` | `llama-3.1-8b-instant` | LLM model to use |
-| `LOG_LEVEL` | `INFO` | Logging level |
-| `SCHEMES_FILE` | `data/raw/scheme.json` | Path to schemes data file |
-| `AUTO_INGEST` | `true` | Auto-ingest schemes on startup |
-| `FORCE_RECREATE_COLLECTION` | `false` | Force recreate Qdrant collection |
-| `QDRANT_MODE` | `local` | `local` or `cloud` |
-| `QDRANT_LOCAL_PATH` | `./qdrant_data` | Local Qdrant storage path |
-| `QDRANT_URL` | `http://localhost:6333` | Qdrant server URL (for cloud mode) |
-| `QDRANT_API_KEY` | - | Qdrant API key (for cloud mode) |
-| `API_BASE_URL` | `http://127.0.0.1:8000` | Base URL for API calls |
+- `SARVAM_API_KEY`
+  - required for the real Sarvam LLM path and for speech features
+- `TWILIO_*`
+  - optional, only needed for WhatsApp integration
 
-### Data Files
+If `SARVAM_API_KEY` is missing, the current Sarvam client returns a mock transcription for audio requests.
 
-- `data/raw/scheme.json`: Contains scraped government scheme data
-- `checkpoints/chat_sessions.json`: Stores chat session history
-- `qdrant_data/`: Local Qdrant vector database storage
-
-## Development
-
-### Running Tests
+## Running the backend
 
 ```bash
-# Add tests as needed
+source .venv/bin/activate
+python3 main.py
 ```
 
-### Code Structure
+The backend runs at `http://127.0.0.1:8000`.
 
-```
-GovAssist-RAG/
-├── govassist/
-│   ├── api/
-│   │   └── app.py         # FastAPI application
-│   ├── ingestion/
-│   │   └── scraper.py     # Playwright scraper
-│   ├── rag/
-│   │   ├── embeddings.py  # Embedding and data normalization
-│   │   ├── llm.py         # Groq client and prompt building
-│   │   ├── pipeline.py    # Retrieval and answer orchestration
-│   │   └── vector_store.py# Qdrant integration
-│   ├── storage/
-│   │   └── checkpointer.py# Session persistence
-│   └── config.py          # Shared environment loading
-├── ui/
-│   └── streamlit_app.py   # Streamlit UI implementation
-├── data/
-│   └── raw/
-│       └── scheme.json    # Scraped scheme data
-├── main.py                # Compatibility API entrypoint
-├── scrape.py              # Compatibility scraper entrypoint
-├── streamlit_app.py       # Compatibility Streamlit entrypoint
-├── requirements.txt
-└── .env
-```
+## Data Stores
 
-### Adding New Features
+- [govassist/api/schemes.db](/home/slakshman2004/GovAssist-RAG/govassist/api/schemes.db)
+  - normalized scheme records in SQLite
+- [govassist/api/chat_history.db](/home/slakshman2004/GovAssist-RAG/govassist/api/chat_history.db)
+  - chat session snapshots in SQLite
+- `qdrant_data/`
+  - local vector database and graph artifacts
+- [data/raw/scheme.json](/home/slakshman2004/GovAssist-RAG/data/raw/scheme.json)
+  - scraped scheme source data
 
-1. For new embedding models: Modify `EmbeddingService` in `govassist/rag/embeddings.py`
-2. For different LLMs: Update `GroqLLMClient` in `govassist/rag/llm.py`
-3. For additional categories: Add URLs to `CATEGORY_URLS` in `govassist/ingestion/scraper.py`
-4. For new API endpoints: Add routes in `govassist/api/app.py`
+## Legacy Modules
 
-## Contributing
+There are older modules still present for reference:
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+- [govassist/rag/pipeline.py](/home/slakshman2004/GovAssist-RAG/govassist/rag/pipeline.py)
+- [govassist/rag/llm.py](/home/slakshman2004/GovAssist-RAG/govassist/rag/llm.py)
+- [govassist/storage/checkpointer.py](/home/slakshman2004/GovAssist-RAG/govassist/storage/checkpointer.py)
 
-## License
+They are not on the active FastAPI + LangGraph runtime path.
 
-This project is open source. Please check the license file for details.
+## Notes
 
-## Disclaimer
-
-This project scrapes data from government websites for informational purposes. Please verify scheme details and eligibility from official sources before applying. The developers are not responsible for any inaccuracies in the scraped data.
+- The backend root no longer attempts to serve a stale `web/index.html`.
+- The active UI is the Next.js app, not the older Vue-based description from earlier project docs.
+- Streaming now uses the same graph-backed orchestration path as blocking chat for text, audio, and document requests.
+- Standalone `scrape.py` and `POST /scrape` both auto-refresh Qdrant and the graph store when `AUTO_INGEST=true`.

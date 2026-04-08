@@ -1,11 +1,19 @@
+"""Legacy reference pipeline.
+
+The active runtime path uses FastAPI + LangGraph under `govassist/api/api.py`
+and `govassist/agents/*`. This module is kept for reference and is not wired
+into the current application flow.
+"""
+
 import logging
 import os
 import re
 import uuid
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from govassist.rag.embeddings import EmbeddingService, infer_tags_from_text, load_schemes
-from govassist.rag.llm import GroqLLMClient
+from govassist.rag.llm import SarvamLLMClient
 from govassist.rag.vector_store import QdrantManager
 from govassist.storage.checkpointer import FileCheckpointer
 
@@ -13,16 +21,32 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_data_file() -> str:
-    """Resolve the scheme data path, supporting the new data folder and the old root file."""
+    """Resolve scheme data path with fallback for legacy .env values."""
     configured_path = os.getenv("SCHEMES_FILE")
+    project_root = Path(__file__).resolve().parents[2]
+
+    candidates: List[Path] = []
     if configured_path:
-        return configured_path
+        configured = Path(configured_path)
+        candidates.append(configured)
+        if not configured.is_absolute():
+            candidates.append(project_root / configured)
 
-    for candidate in ("data/raw/scheme.json", "scheme.json"):
-        if os.path.exists(candidate):
-            return candidate
+    candidates.extend(
+        [
+            Path("data/raw/scheme.json"),
+            project_root / "data/raw/scheme.json",
+            Path("scheme.json"),
+            project_root / "scheme.json",
+        ]
+    )
 
-    return "data/raw/scheme.json"
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    # Prefer the canonical location for clear startup errors if all candidates are missing.
+    return str(project_root / "data/raw/scheme.json")
 
 
 class GovernmentSchemesRAG:
@@ -30,11 +54,11 @@ class GovernmentSchemesRAG:
         self,
         collection_name: str = "schemes",
         embedding_model: str = "BAAI/bge-small-en-v1.5",
-        llm_model: str = "llama-3.1-8b-instant",
+        llm_model: str = "sarvam-m",
     ) -> None:
         self.embedding_service = EmbeddingService(model_name=embedding_model)
         self.qdrant = QdrantManager(collection_name=collection_name)
-        self.llm = GroqLLMClient(model_name=llm_model)
+        self.llm = SarvamLLMClient(model_name=llm_model)
         self.checkpointer = FileCheckpointer()
         self.schemes_cache: List[Dict] = []
 

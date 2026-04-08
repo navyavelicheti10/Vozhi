@@ -1,8 +1,15 @@
 import json
+import logging
 import os
 import re
+import time
 from playwright.async_api import async_playwright
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 OUTPUT_FILE = os.getenv("SCRAPE_OUTPUT_FILE", "data/raw/scheme.json")
 MAX_SCHEMES_PER_CATEGORY = int(os.getenv("MAX_SCHEMES_PER_CATEGORY", "0")) or None
 
@@ -198,19 +205,25 @@ async def extract_section(page, keywords):
 
 # ✅ GET LINKS
 async def get_scheme_links(page, url):
-    print(f"\n🌐 Opening: {url}")
+    logger.info("[LINKS] Opening category page: %s", url)
+    t0 = time.monotonic()
 
     await page.goto(url, timeout=60000)
+    logger.info("[LINKS] Page loaded, waiting for network idle...")
     await page.wait_for_load_state("networkidle")
+    logger.info("[LINKS] Network idle reached. Waiting 7s for dynamic content...")
 
     # Extra wait for dynamic content
     await page.wait_for_timeout(7000)
+    logger.info("[LINKS] Dynamic content wait done. Starting scroll (10 passes)...")
 
     # Scroll more (important for lazy loading)
-    for _ in range(10):
+    for scroll_i in range(10):
         await page.mouse.wheel(0, 4000)
         await page.wait_for_timeout(1500)
+        logger.debug("[LINKS] Scroll pass %d/10 complete", scroll_i + 1)
 
+    logger.info("[LINKS] Scrolling done. Extracting scheme links...")
     links = await page.eval_on_selector_all(
         "a",
         "elements => elements.map(e => e.href)"
@@ -221,13 +234,17 @@ async def get_scheme_links(page, url):
         if l and "/schemes/" in l and len(l.split("/schemes/")[-1]) < 40
     ]))
 
-    print(f"🔗 Found {len(links)} scheme links")
+    elapsed = time.monotonic() - t0
+    logger.info("[LINKS] Found %d scheme links for %s (took %.1fs)", len(links), url, elapsed)
     return links
 
 
 async def scrape_scheme(page, url, category):
+    t0 = time.monotonic()
     try:
+        logger.info("[SCHEME] Navigating to: %s", url)
         await page.goto(url, timeout=60000)
+        logger.debug("[SCHEME] Waiting for network idle on: %s", url)
         await page.wait_for_load_state("networkidle")
 
         # Dismiss popups
@@ -245,13 +262,15 @@ async def scrape_scheme(page, url, category):
                     close_btn = page.locator(selector).first
                     if await close_btn.is_visible():
                         await close_btn.click()
+                        logger.debug("[SCHEME] Dismissed popup with selector: %s", selector)
                         await page.wait_for_timeout(500)
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
 
         # Wait for title properly
+        logger.debug("[SCHEME] Waiting for h1 title element...")
         await page.wait_for_selector("h1", timeout=10000)
 
         name = await page.locator("h1").first.inner_text()
@@ -259,21 +278,27 @@ async def scrape_scheme(page, url, category):
         # Fallback if empty
         if not name or len(name.strip()) == 0:
             name = await page.title()
+            logger.debug("[SCHEME] h1 was empty, fell back to page title: %s", name)
 
-        print("TITLE DEBUG:", name)
+        logger.info("[SCHEME] Extracting sections for: %s", name.strip())
 
         details = await extract_section(page, ["details", "description", "about the scheme"])
-        print(f"DEBUG: Details extracted: {details[:200]}...")
+        logger.debug("[SCHEME] details extracted: %d chars", len(details))
+
         eligibility = await extract_section(page, ["eligibility"])
-        print(f"DEBUG: Eligibility extracted: {eligibility[:200]}...")
+        logger.debug("[SCHEME] eligibility extracted: %d chars", len(eligibility))
+
         benefits = await extract_section(page, ["benefits"])
-        print(f"DEBUG: Benefits extracted: {benefits[:200]}...")
+        logger.debug("[SCHEME] benefits extracted: %d chars", len(benefits))
+
         documents = await extract_section(page, ["documents required", "document required", "documents"])
-        print(f"DEBUG: Documents extracted: {documents[:200]}...")
+        logger.debug("[SCHEME] documents extracted: %d chars", len(documents))
+
         application = await extract_section(page, ["application process", "how to apply"])
-        print(f"DEBUG: Application extracted: {application[:200]}...")
+        logger.debug("[SCHEME] application_process extracted: %d chars", len(application))
 
         if not details:
+            logger.warning("[SCHEME] No details section found for %s — trying fallback selectors", url)
             # Try to get content from main or specific containers
             content_selectors = ["main", ".content", ".scheme-details", ".tab-content", "[role='main']"]
             for selector in content_selectors:
@@ -282,9 +307,13 @@ async def scrape_scheme(page, url, category):
                     main_content = clean_text(main_content)
                     if len(main_content) > 100 and not is_noise(main_content[:500]):
                         details = main_content[:1500]
+                        logger.info("[SCHEME] Fallback content found via selector '%s' (%d chars)", selector, len(details))
                         break
-                except:
+                except Exception:
                     continue
+
+        if not details:
+            logger.warning("[SCHEME] All fallback selectors failed for: %s", url)
 
         documents_list = split_items(documents)
 
@@ -300,52 +329,118 @@ async def scrape_scheme(page, url, category):
             "tags": []
         }
 
-        print(f"✅ {scheme['scheme_name']}")
+        elapsed = time.monotonic() - t0
+        logger.info("[SCHEME] ✓ Scraped '%s' in %.1fs", scheme["scheme_name"], elapsed)
         return scheme
 
     except Exception as e:
-        print(f"❌ Error: {url} → {e}")
+        elapsed = time.monotonic() - t0
+        logger.exception("[SCHEME] ✗ Failed to scrape %s after %.1fs: %s", url, elapsed, e)
         return None
 
 
 # ✅ MAIN
 async def main():
+    pipeline_start = time.monotonic()
     all_data = []
+    total_links = 0
+    failed_links = 0
+
+    logger.info("========================================")
+    logger.info("[PIPELINE] GovAssist scraper starting")
+    logger.info("[PIPELINE] Categories to scrape: %d", len(CATEGORY_URLS))
+    logger.info("[PIPELINE] MAX_SCHEMES_PER_CATEGORY: %s", MAX_SCHEMES_PER_CATEGORY or "unlimited")
+    logger.info("[PIPELINE] Output file: %s", OUTPUT_FILE)
+    logger.info("========================================")
 
     async with async_playwright() as p:
+        logger.info("[PIPELINE] Launching Chromium (headless)...")
         browser = await p.chromium.launch(headless=True)
+        logger.info("[PIPELINE] Chromium launched OK")
 
         context = await browser.new_context(
             user_agent="Mozilla/5.0"
         )
 
         page = await context.new_page()
+        logger.info("[PIPELINE] Browser context and page ready")
 
-        for url in CATEGORY_URLS:
+        for cat_idx, url in enumerate(CATEGORY_URLS, start=1):
             category = url.split("/")[-1]
-            print(f"\n📂 CATEGORY: {category}")
+            cat_start = time.monotonic()
+            logger.info("")
+            logger.info("[CATEGORY %d/%d] Starting: %s", cat_idx, len(CATEGORY_URLS), category)
 
             links = await get_scheme_links(page, url)
 
             if MAX_SCHEMES_PER_CATEGORY:
                 links = links[:MAX_SCHEMES_PER_CATEGORY]
+                logger.info("[CATEGORY %d/%d] Capped to %d links", cat_idx, len(CATEGORY_URLS), len(links))
 
-            for link in links:
+            total_links += len(links)
+            cat_scraped = 0
+            cat_failed = 0
+
+            for link_idx, link in enumerate(links, start=1):
+                logger.info(
+                    "[CATEGORY %d/%d | SCHEME %d/%d] Scraping: %s",
+                    cat_idx, len(CATEGORY_URLS), link_idx, len(links), link
+                )
                 scheme = await scrape_scheme(page, link, category)
 
-                if scheme:   # ✅ save even if imperfect
+                if scheme:
                     all_data.append(scheme)
+                    cat_scraped += 1
+                else:
+                    cat_failed += 1
+                    failed_links += 1
 
                 await page.wait_for_timeout(1500)
 
-    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+            cat_elapsed = time.monotonic() - cat_start
+            logger.info(
+                "[CATEGORY %d/%d] Done: %s — scraped=%d, failed=%d, time=%.1fs",
+                cat_idx, len(CATEGORY_URLS), category, cat_scraped, cat_failed, cat_elapsed
+            )
 
-    # Save JSON
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_data, f, indent=2, ensure_ascii=False)
+        logger.info("[PIPELINE] Closing browser...")
+        await browser.close()
+        logger.info("[PIPELINE] Browser closed")
 
-    print(f"\n🎉 DONE! Saved {len(all_data)} schemes")
+    # ── Persist results ──────────────────────────────────────────────────────
+    logger.info("")
+    logger.info("[PERSIST] Total scraped: %d schemes, %d failed out of %d links", len(all_data), failed_links, total_links)
+
+    try:
+        output_path = OUTPUT_FILE
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        logger.info("[PERSIST] Writing JSON to: %s", output_path)
+        with open(output_path, "w", encoding="utf-8") as file:
+            json.dump(all_data, file, ensure_ascii=False, indent=2)
+        logger.info("[PERSIST] JSON written OK (%d bytes)", os.path.getsize(output_path))
+
+        logger.info("[PERSIST] Inserting %d schemes into SQLite...", len(all_data))
+        from govassist.api.db_utils import insert_scheme
+        for i, scheme in enumerate(all_data, start=1):
+            insert_scheme(scheme)
+            if i % 50 == 0 or i == len(all_data):
+                logger.info("[PERSIST] SQLite upsert progress: %d/%d", i, len(all_data))
+
+        pipeline_elapsed = time.monotonic() - pipeline_start
+        logger.info("========================================")
+        logger.info(
+            "[PIPELINE] Complete — %d schemes saved, total time=%.1fs",
+            len(all_data), pipeline_elapsed
+        )
+        logger.info("========================================")
+
+    except Exception as e:
+        logger.exception("[PERSIST] Failed to persist scraped schemes: %s", e)
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
