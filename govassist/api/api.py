@@ -65,7 +65,9 @@ class ParsedChatRequest(BaseModel):
     query_text: str
     raw_query: str = ""
     transcribed_text: str = ""
-    uploaded_file_path: Optional[Path] = None
+    uploaded_document_path: Optional[Path] = None
+    uploaded_audio_path: Optional[Path] = None
+    uploaded_document_name: str = ""
     query_language_code: str = "en-IN"
     response_language_code: str = "en-IN"
 
@@ -93,6 +95,11 @@ def _detect_input_type(upload_file: UploadFile | None) -> str:
         return "document"
 
     raise HTTPException(status_code=400, detail="Unsupported file type. Use audio or image/pdf documents.")
+
+
+def _combine_query_inputs(*values: str) -> str:
+    normalized = [value.strip() for value in values if value and value.strip()]
+    return "\n".join(normalized)
 
 
 async def _persist_upload(upload_file: UploadFile, session_id: str) -> Path:
@@ -189,10 +196,13 @@ async def _parse_chat_request(request: Request) -> ParsedChatRequest:
     query_text = ""
     raw_query = ""
     transcribed_text = ""
-    uploaded_file: UploadFile | None = None
     uploaded_file_path: Path | None = None
+    uploaded_document_path: Path | None = None
+    uploaded_audio_path: Path | None = None
+    uploaded_document_name = ""
     query_language_code = "en-IN"
     response_language_code = "en-IN"
+    input_type = "text"
 
     try:
         if any(text_type in content_type for text_type in TEXT_MIME_TYPES):
@@ -204,39 +214,63 @@ async def _parse_chat_request(request: Request) -> ParsedChatRequest:
         elif "multipart/form-data" in content_type:
             form = await request.form()
             session_id = str(form.get("session_id") or session_id)
-            raw_query = str(form.get("query") or form.get("text") or "").strip()
+            raw_query = _combine_query_inputs(
+                str(form.get("query") or "").strip(),
+                str(form.get("text") or "").strip(),
+            )
             query_text = raw_query
-            uploaded_file = form.get("file")
-            if uploaded_file is None:
-                raise HTTPException(status_code=400, detail="Multipart chat requests require a file.")
+            primary_file = form.get("file")
+            secondary_audio = form.get("audio_file") or form.get("voice_file")
 
-            input_type = _detect_input_type(uploaded_file)
-            uploaded_file_path = await _persist_upload(uploaded_file, session_id)
+            if primary_file is None and secondary_audio is None:
+                raise HTTPException(status_code=400, detail="Multipart chat requests require a document or audio file.")
+
+            primary_type = _detect_input_type(primary_file) if primary_file is not None else ""
+            secondary_type = _detect_input_type(secondary_audio) if secondary_audio is not None else ""
+
+            if primary_type == "document":
+                uploaded_document_path = await _persist_upload(primary_file, session_id)
+                uploaded_document_name = primary_file.filename or uploaded_document_path.name
+            elif primary_type == "audio":
+                uploaded_audio_path = await _persist_upload(primary_file, session_id)
+            elif primary_file is not None:
+                raise HTTPException(status_code=400, detail="Unsupported primary upload type.")
+
+            if secondary_type == "audio":
+                uploaded_audio_path = await _persist_upload(secondary_audio, session_id)
+            elif secondary_audio is not None:
+                raise HTTPException(status_code=400, detail="The extra upload must be an audio file.")
+
+            if uploaded_document_path is not None:
+                uploaded_file_path = uploaded_document_path
+                input_type = "document"
+            elif uploaded_audio_path is not None:
+                uploaded_file_path = uploaded_audio_path
+                input_type = "audio"
         else:
             raise HTTPException(
                 status_code=415,
                 detail="Unsupported content type. Use application/json for text or multipart/form-data for files.",
             )
 
-        if input_type == "audio":
-            if uploaded_file_path is None:
-                raise HTTPException(status_code=400, detail="Audio upload is missing.")
-            stt_payload = sarvam_client.speech_to_text_with_metadata(str(uploaded_file_path))
+        if uploaded_audio_path is not None:
+            stt_payload = sarvam_client.speech_to_text_with_metadata(str(uploaded_audio_path))
             transcribed_text = stt_payload.get("transcript", "").strip()
             if not transcribed_text:
                 raise HTTPException(status_code=502, detail="Audio transcription failed.")
             query_language_code = stt_payload.get("language_code", "en-IN")
             response_language_code = query_language_code
-            raw_query = transcribed_text
+            raw_query = _combine_query_inputs(raw_query, transcribed_text)
             if query_language_code != "en-IN":
                 translated = sarvam_client.translate_text(
                     text=transcribed_text,
                     source_language_code=query_language_code,
                     target_language_code="en-IN",
                 )
-                query_text = translated.get("translated_text", transcribed_text).strip() or transcribed_text
+                translated_stt = translated.get("translated_text", transcribed_text).strip() or transcribed_text
             else:
-                query_text = transcribed_text
+                translated_stt = transcribed_text
+            query_text = _combine_query_inputs(query_text, translated_stt)
         elif query_text:
             translated = sarvam_client.translate_text(
                 text=query_text,
@@ -248,8 +282,9 @@ async def _parse_chat_request(request: Request) -> ParsedChatRequest:
             if query_language_code != "en-IN":
                 query_text = translated.get("translated_text", query_text).strip() or query_text
     except Exception:
-        if uploaded_file_path and uploaded_file_path.exists():
-            uploaded_file_path.unlink(missing_ok=True)
+        for temp_path in (uploaded_document_path, uploaded_audio_path, uploaded_file_path):
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
         raise
 
     return ParsedChatRequest(
@@ -258,7 +293,9 @@ async def _parse_chat_request(request: Request) -> ParsedChatRequest:
         query_text=query_text,
         raw_query=raw_query,
         transcribed_text=transcribed_text,
-        uploaded_file_path=uploaded_file_path,
+        uploaded_document_path=uploaded_document_path,
+        uploaded_audio_path=uploaded_audio_path,
+        uploaded_document_name=uploaded_document_name,
         query_language_code=query_language_code,
         response_language_code=response_language_code,
     )
@@ -371,7 +408,7 @@ async def chat(request: Request):
             input_type=parsed_request.input_type,
             query_text=parsed_request.query_text,
             session_id=parsed_request.session_id,
-            uploaded_file_path=parsed_request.uploaded_file_path,
+            uploaded_file_path=parsed_request.uploaded_document_path,
             transcribed_text=parsed_request.transcribed_text,
             raw_query=parsed_request.raw_query,
             query_language_code=parsed_request.query_language_code,
@@ -386,8 +423,10 @@ async def chat(request: Request):
         logger.exception("Chat request failed")
         raise HTTPException(status_code=500, detail=f"Chat orchestration failed: {exc}") from exc
     finally:
-        if parsed_request and parsed_request.uploaded_file_path and parsed_request.uploaded_file_path.exists():
-            parsed_request.uploaded_file_path.unlink(missing_ok=True)
+        if parsed_request:
+            for temp_path in (parsed_request.uploaded_document_path, parsed_request.uploaded_audio_path):
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
 
 
 @app.post("/chat/stream")
@@ -398,7 +437,7 @@ async def chat_stream(request: Request):
         input_type=parsed_request.input_type,
         query_text=parsed_request.query_text,
         session_id=parsed_request.session_id,
-        uploaded_file_path=parsed_request.uploaded_file_path,
+        uploaded_file_path=parsed_request.uploaded_document_path,
         transcribed_text=parsed_request.transcribed_text,
         raw_query=parsed_request.raw_query,
         query_language_code=parsed_request.query_language_code,
@@ -421,8 +460,9 @@ async def chat_stream(request: Request):
             logger.exception("Streaming chat request failed")
             yield json.dumps({"type": "error", "detail": f"Chat orchestration failed: {exc}"}) + "\n"
         finally:
-            if parsed_request.uploaded_file_path and parsed_request.uploaded_file_path.exists():
-                parsed_request.uploaded_file_path.unlink(missing_ok=True)
+            for temp_path in (parsed_request.uploaded_document_path, parsed_request.uploaded_audio_path):
+                if temp_path and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 

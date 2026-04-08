@@ -6,7 +6,7 @@ import io
 import re
 import wave
 import requests
-from typing import Optional
+from typing import Any, Optional
 
 from govassist.config import load_env_file
 
@@ -37,15 +37,35 @@ SUPPORTED_TTS_LANGUAGE_CODES = {
 }
 
 class SarvamAIClient:
-    """Wrapper for Sarvam AI for Speech-to-Text and Text-to-Speech across 12+ Indian languages."""
+    """Wrapper for Sarvam AI chat, speech, translation, and TTS APIs."""
     
     def __init__(self):
         load_env_file()
         self.api_key = os.getenv("SARVAM_API_KEY", "")
         self.base_url = "https://api.sarvam.ai"
+        self.chat_model = os.getenv("SARVAM_CHAT_MODEL", "sarvam-m").strip() or "sarvam-m"
         
         if not self.api_key:
             logger.warning("SARVAM_API_KEY not set. Sarvam integration will be mocked/fail.")
+
+    def _auth_headers(self, content_type: str = "application/json") -> dict[str, str]:
+        return {
+            "api-subscription-key": self.api_key,
+            "Content-Type": content_type,
+        }
+
+    def _post_json(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        timeout: int = 120,
+    ) -> requests.Response:
+        return requests.post(
+            f"{self.base_url}{endpoint}",
+            headers=self._auth_headers(),
+            json=payload,
+            timeout=timeout,
+        )
 
     def _refresh_api_key(self) -> str:
         load_env_file()
@@ -152,6 +172,57 @@ class SarvamAIClient:
         result = self.speech_to_text_with_metadata(audio_file_path=audio_file_path, language_code=language_code)
         return result.get("transcript", "")
 
+    def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        model: str | None = None,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+        reasoning_effort: str | None = None,
+        wiki_grounding: bool = False,
+    ) -> str:
+        api_key = self._refresh_api_key()
+        normalized_messages = [
+            {
+                "role": (message.get("role") or "user").strip(),
+                "content": (message.get("content") or "").strip(),
+            }
+            for message in messages
+            if (message.get("content") or "").strip()
+        ]
+        if not normalized_messages:
+            return ""
+
+        if not api_key:
+            logger.info("Mock Sarvam chat completion path hit because SARVAM_API_KEY is missing.")
+            return normalized_messages[-1]["content"]
+
+        payload: dict[str, Any] = {
+            "messages": normalized_messages,
+            "model": (model or self.chat_model or "sarvam-m").strip() or "sarvam-m",
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+            "wiki_grounding": wiki_grounding,
+        }
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+
+        try:
+            response = self._post_json("/v1/chat/completions", payload=payload, timeout=180)
+            if response.status_code != 200:
+                logger.error("Sarvam chat completion failed: %s", response.text)
+                raise RuntimeError(f"Sarvam chat completion failed with status {response.status_code}")
+
+            body = response.json()
+            choices = body.get("choices") or []
+            message = choices[0].get("message") if choices else {}
+            content = (message or {}).get("content") or ""
+            return content.strip()
+        except Exception as exc:
+            logger.error("Sarvam chat completion exception: %s", exc)
+            raise
+
     def speech_to_text_with_metadata(self, audio_file_path: str, language_code: str = "unknown") -> dict[str, str]:
         """Transcribes incoming voice note and returns transcript plus detected language."""
         api_key = self._refresh_api_key()
@@ -174,9 +245,7 @@ class SarvamAIClient:
                     "language_code": language_code,
                     "prompt": "",
                 }
-                headers = {
-                    "api-subscription-key": api_key
-                }
+                headers = {"api-subscription-key": api_key}
                 logger.info("Sending audio file to Sarvam STT with content type: %s", content_type)
                 response = requests.post(url, headers=headers, files=files, data=data, timeout=120)
                 
@@ -221,16 +290,10 @@ class SarvamAIClient:
             }
 
         url = f"{self.base_url}/translate"
-        headers = {
-            "api-subscription-key": api_key,
-            "Content-Type": "application/json",
-        }
-
         try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json={
+            response = self._post_json(
+                "/translate",
+                payload={
                     "input": normalized_text[:2000],
                     "source_language_code": source_language_code,
                     "target_language_code": target_language_code,
@@ -265,14 +328,9 @@ class SarvamAIClient:
             logger.info("Mock TTS: returning a short silent WAV clip.")
             return self._build_silence_wav()
             
-        url = f"{self.base_url}/text-to-speech"
         segments = self._split_tts_segments(text=text, max_chars=500)
         if not segments:
             return b""
-        headers = {
-            "api-subscription-key": api_key,
-            "Content-Type": "application/json"
-        }
         
         try:
             merged_batches: list[bytes] = []
@@ -288,7 +346,7 @@ class SarvamAIClient:
                     "enable_preprocessing": True,
                     "model": "bulbul:v3"
                 }
-                response = requests.post(url, headers=headers, json=payload, timeout=120)
+                response = self._post_json("/text-to-speech", payload=payload, timeout=120)
                 if response.status_code != 200:
                     logger.error("Sarvam TTS failed: %s", response.text)
                     return b""

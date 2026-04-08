@@ -4,8 +4,7 @@ GovAssist is a multimodal government-schemes assistant for Indian public-benefit
 
 - FastAPI for the backend API
 - LangGraph for orchestration
-- Groq for query refinement and final answer generation
-- Sarvam for speech-to-text
+- Sarvam for query refinement, final answer generation, speech-to-text, translation, and text-to-speech
 - EasyOCR and `pypdf` for document extraction
 - SQLite for scheme storage and chat history
 - Qdrant for vector retrieval
@@ -38,7 +37,7 @@ Main runtime files:
 - Small-talk handling for greeting, thanks, and goodbye messages
 - Streaming assistant responses
 - Audio upload and in-browser microphone recording
-- Speech-to-text using Sarvam before Groq inference
+- Speech-to-text using Sarvam
 - On-demand text-to-speech for assistant responses using Sarvam
 - PDF and image document extraction
 - Semantic retrieval with Qdrant
@@ -116,8 +115,8 @@ If `NEXT_PUBLIC_API_BASE_URL` is omitted, the frontend uses same-origin relative
 Create a `.env` file in the repo root:
 
 ```env
-GROQ_API_KEY=
 SARVAM_API_KEY=
+SARVAM_CHAT_MODEL=sarvam-m
 LOG_LEVEL=INFO
 SCHEMES_FILE=scheme.json
 AUTO_INGEST=true
@@ -133,10 +132,8 @@ TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
 
 ### Required vs optional credentials
 
-- `GROQ_API_KEY`
-  - required for the real LLM path
 - `SARVAM_API_KEY`
-  - optional, but required for real speech-to-text and text-to-speech
+  - required for the real Sarvam LLM path and for speech features
 - `TWILIO_*`
   - optional, only needed for WhatsApp integration
 

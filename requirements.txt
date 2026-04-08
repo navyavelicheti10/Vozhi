@@ -1,12 +1,9 @@
 easyocr
 fastapi
-groq
 langchain-core
-langchain-groq
 langgraph
 llama-index-core
 llama-index-embeddings-huggingface
-llama-index-llms-groq
 numpy
 playwright
 pypdf

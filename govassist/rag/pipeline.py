@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from govassist.rag.embeddings import EmbeddingService, infer_tags_from_text, load_schemes
-from govassist.rag.llm import GroqLLMClient
+from govassist.rag.llm import SarvamLLMClient
 from govassist.rag.vector_store import QdrantManager
 from govassist.storage.checkpointer import FileCheckpointer
 
@@ -54,11 +54,11 @@ class GovernmentSchemesRAG:
         self,
         collection_name: str = "schemes",
         embedding_model: str = "BAAI/bge-small-en-v1.5",
-        llm_model: str = "llama-3.1-8b-instant",
+        llm_model: str = "sarvam-m",
     ) -> None:
         self.embedding_service = EmbeddingService(model_name=embedding_model)
         self.qdrant = QdrantManager(collection_name=collection_name)
-        self.llm = GroqLLMClient(model_name=llm_model)
+        self.llm = SarvamLLMClient(model_name=llm_model)
         self.checkpointer = FileCheckpointer()
         self.schemes_cache: List[Dict] = []
 

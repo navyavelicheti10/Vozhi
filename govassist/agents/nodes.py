@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
 
 from govassist.agents.state import AgentState
 from govassist.api.db_utils import search_schemes_in_db
@@ -16,7 +15,6 @@ from govassist.rag.vector_store import QdrantManager
 
 logger = logging.getLogger(__name__)
 
-llm: ChatGroq | None = None
 embedding_service: EmbeddingService | None = None
 qdrant: QdrantManager | None = None
 ocr_reader = None
@@ -173,13 +171,25 @@ def _safe_json_loads(payload: str) -> Dict[str, Any]:
 
 
 def _ensure_llm() -> None:
-    global llm
-
-    if llm is not None:
-        return
-
     load_env_file()
-    llm = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.2, max_retries=10)
+
+
+def _invoke_llm(
+    messages: List[SystemMessage | HumanMessage],
+    temperature: float = 0.2,
+    max_tokens: int = 1200,
+) -> str:
+    payload = []
+    for message in messages:
+        role = "system"
+        if isinstance(message, HumanMessage):
+            role = "user"
+        payload.append({"role": role, "content": str(message.content)})
+    return sarvam_client.chat_completion(
+        messages=payload,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
 
 
 def _ensure_rag_clients() -> None:
@@ -236,6 +246,24 @@ def _extract_image_text(file_path: Path) -> str:
         return ""
 
 
+def _seed_query_from_state(state: AgentState) -> str:
+    return clean_text(
+        state.get("current_query", "")
+        or state.get("raw_query", "")
+        or state.get("transcribed_text", "")
+    )
+
+
+def _build_query_from_document(query_text: str, extracted_text: str) -> str:
+    query = clean_text(query_text)
+    document_text = clean_text(extracted_text)
+    if query and document_text:
+        return f"{query}\n\nDocument extracted text:\n{document_text[:2500]}"
+    if document_text:
+        return f"Find relevant government schemes using this uploaded document:\n{document_text[:2500]}"
+    return query
+
+
 def _build_document_context(state: AgentState) -> str:
     documents_extracted = state.get("documents_extracted") or {}
     raw_text = clean_text(documents_extracted.get("raw_text", ""))
@@ -244,10 +272,12 @@ def _build_document_context(state: AgentState) -> str:
 
     if state.get("raw_query"):
         parts.append(f"User request: {clean_text(state['raw_query'])}")
+    if state.get("transcribed_text"):
+        parts.append(f"Speech query: {clean_text(state['transcribed_text'])}")
     if structured_fields:
         parts.append(f"Document fields: {json.dumps(structured_fields, ensure_ascii=True)}")
     if raw_text:
-        parts.append(f"Document text: {raw_text[:1200]}")
+        parts.append(f"Document text: {raw_text[:1800]}")
 
     return "\n".join(parts).strip()
 
@@ -356,10 +386,9 @@ def _post_rag_response(state: AgentState) -> Dict[str, Any]:
         }
 
     try:
-        response = llm.invoke(_build_post_rag_messages(state))
-        content = response.content.strip()
+        content = _invoke_llm(_build_post_rag_messages(state), temperature=0.2, max_tokens=1400).strip()
     except Exception as exc:
-        logger.warning("LLM post-RAG synthesis failed (possibly Rate Limit): %s", exc)
+        logger.warning("Sarvam post-RAG synthesis failed: %s", exc)
         fallback_lines = ["I found some relevant schemes for you (Note: Intelligent synthesis delayed due to high load):\n"]
         for scheme in schemes:
             name = scheme.get("scheme_name", "Unknown Scheme")
@@ -385,10 +414,11 @@ def main_agent(state: AgentState) -> Dict[str, Any]:
     """Primary router that decides whether to answer directly or run RAG."""
     _ensure_llm()
 
-    seed_query = clean_text(
-        state.get("raw_query", "") or state.get("transcribed_text", "") or state.get("current_query", "")
-    )
+    seed_query = clean_text(_seed_query_from_state(state))
+    has_document_context = bool((state.get("documents_extracted") or {}).get("raw_text"))
     if not seed_query:
+        if has_document_context:
+            return {"route": "retrieve"}
         reply = _localize_text(
             "Tell me what you need, and I’ll help. If you're looking for a government scheme, share your state or purpose.",
             state,
@@ -419,6 +449,9 @@ def main_agent(state: AgentState) -> Dict[str, Any]:
 
     if _is_assistant_meta_query(seed_query):
         return {"route": "respond"}
+
+    if has_document_context:
+        return {"route": "retrieve", "current_query": seed_query}
 
     if _looks_like_scheme_query(seed_query):
         return {"route": "retrieve"}
@@ -467,15 +500,18 @@ def _pre_rag_query_refinement(state: AgentState) -> Dict[str, Any]:
     human_content = history_str + f"Latest User Query: {human_content}"
 
     try:
-        response = llm.invoke(
-            [
-                SystemMessage(content=prompt),
-                HumanMessage(content=human_content),
-            ]
-        )
-        normalized_query = clean_text(response.content).strip("\"'")
+        normalized_query = clean_text(
+            _invoke_llm(
+                [
+                    SystemMessage(content=prompt),
+                    HumanMessage(content=human_content),
+                ],
+                temperature=0.1,
+                max_tokens=220,
+            )
+        ).strip("\"'")
     except Exception as exc:
-        logger.warning("LLM query refinement failed, falling back to original query: %s", exc)
+        logger.warning("Sarvam query refinement failed, falling back to original query: %s", exc)
         normalized_query = seed_query
 
     return {"current_query": normalized_query or seed_query}
@@ -487,9 +523,7 @@ def llm_agent(state: AgentState) -> Dict[str, Any]:
         logger.info("Running LLM agent in post-RAG synthesis mode")
         return _post_rag_response(state)
 
-    seed_query = clean_text(
-        state.get("raw_query", "") or state.get("transcribed_text", "") or state.get("current_query", "")
-    )
+    seed_query = clean_text(_seed_query_from_state(state))
     if state.get("route") == "respond":
         logger.info("Answering directly without RAG for query: %s", seed_query)
         
@@ -511,13 +545,18 @@ def llm_agent(state: AgentState) -> Dict[str, Any]:
         
         try:
             _ensure_llm()
-            response = llm.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=human_content)
-            ])
-            reply = clean_text(response.content)
+            reply = clean_text(
+                _invoke_llm(
+                    [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=human_content),
+                    ],
+                    temperature=0.3,
+                    max_tokens=300,
+                )
+            )
         except Exception as exc:
-            logger.warning("LLM direct answer failed: %s", exc)
+            logger.warning("Sarvam direct answer failed: %s", exc)
             reply = (
                 _build_small_talk_response(seed_query)
                 if (_is_small_talk(seed_query) or _is_assistant_meta_query(seed_query))
@@ -562,6 +601,7 @@ def document_agent(state: AgentState) -> Dict[str, Any]:
     structured_fields: Dict[str, Any] = {}
     
     if suffix == ".pdf":
+        # PDFs may already contain selectable text. Image docs go through OCR directly.
         extracted_text = _extract_pdf_text(file_path)
     else:
         logger.info("Routing image %s to EasyOCR extraction.", file_path.name)
@@ -574,20 +614,29 @@ def document_agent(state: AgentState) -> Dict[str, Any]:
             "document_type, name, dob, gender, state, district, income_amount, occupation, id_number, notes."
         )
         try:
-            response = llm.invoke(
-                [
-                    SystemMessage(content=parser_prompt),
-                    HumanMessage(content=extracted_text[:5000]),
-                ]
+            structured_fields = _safe_json_loads(
+                _invoke_llm(
+                    [
+                        SystemMessage(content=parser_prompt),
+                        HumanMessage(content=extracted_text[:5000]),
+                    ],
+                    temperature=0.1,
+                    max_tokens=350,
+                )
             )
-            structured_fields = _safe_json_loads(response.content)
         except Exception as e:
-            logger.warning("LLM structured parsing failed: %s", e)
+            logger.warning("Sarvam structured parsing failed: %s", e)
 
     if not extracted_text and not structured_fields:
         logger.warning("No text could be extracted from document %s", file_path)
 
+    combined_query = _build_query_from_document(
+        query_text=_seed_query_from_state(state),
+        extracted_text=extracted_text,
+    )
+
     return {
+        "current_query": combined_query or _seed_query_from_state(state),
         "documents_extracted": {
             "file_name": file_path.name,
             "file_type": suffix.lstrip("."),

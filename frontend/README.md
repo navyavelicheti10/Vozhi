@@ -36,5 +36,5 @@ If `NEXT_PUBLIC_API_BASE_URL` is omitted, the UI uses same-origin relative paths
 
 - Text requests are sent as JSON.
 - Document and audio requests are sent as `multipart/form-data`.
-- Audio recorded from the mic is uploaded to the backend, transcribed with Sarvam, and then passed into the Groq-backed RAG flow.
+- Audio recorded from the mic is uploaded to the backend, transcribed with Sarvam, and then passed into the Sarvam-backed RAG flow.
 - Document uploads run through the same backend graph path as text and audio chat.

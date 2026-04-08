@@ -39,10 +39,17 @@ interface SourceLink {
   url: string;
 }
 
+interface Attachment {
+  id: string;
+  name: string;
+  kind: "document" | "audio";
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
+  attachments?: Attachment[];
   matches?: SchemeMatch[];
   citations?: string[];
   confidence?: number;
@@ -96,7 +103,15 @@ export default function VozhiApp() {
     sessionRef.current = session;
   }, [session]);
 
-  const createNewSession = useCallback(async () => {
+  const buildAttachment = useCallback((file: File, kind: Attachment["kind"]): Attachment => {
+    return {
+      id: `${kind}-${file.name}-${file.lastModified}`,
+      name: file.name,
+      kind,
+    };
+  }, []);
+
+  const createNewSession = useCallback((seedHistory?: ChatSession[]) => {
     const newSessionId = `web-${Math.random().toString(36).substring(7)}`;
     const initialMsg: Message = {
       id: Date.now().toString(),
@@ -111,20 +126,15 @@ export default function VozhiApp() {
       updatedAt: Date.now(),
     };
 
-    setHistory((currentHistory) => [newSession, ...currentHistory.filter((chat) => chat.id !== newSessionId)]);
+    setHistory((currentHistory) => {
+      const baseHistory = seedHistory ?? currentHistory;
+      return [newSession, ...baseHistory.filter((chat) => chat.id !== newSessionId)];
+    });
     setSession(newSessionId);
     setMessages([initialMsg]);
     setActiveTab("chat");
-
-    await fetch(apiUrl("/api/sessions"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id: newSessionId,
-        title: "New Conversation",
-        messages: [initialMsg],
-      }),
-    }).catch(console.error);
+    setUploadedDoc(null);
+    setInput("");
   }, []);
 
   useEffect(() => {
@@ -135,25 +145,10 @@ export default function VozhiApp() {
 
         const loadedHistory: ChatSession[] = await res.json();
         setHistory(loadedHistory);
-        const latestChat = [...loadedHistory].sort((a, b) => b.updatedAt - a.updatedAt)[0];
-
-        if (!latestChat) {
-          await createNewSession();
-          return;
-        }
-
-        const sessionRes = await fetch(apiUrl(`/api/sessions/${latestChat.id}`));
-        if (!sessionRes.ok) {
-          throw new Error("Failed to load the latest chat");
-        }
-
-        const data = await sessionRes.json();
-        setSession(latestChat.id);
-        setMessages(data.messages || []);
-        setActiveTab("chat");
+        createNewSession(loadedHistory);
       } catch (e) {
         console.error("Failed to load history from DB", e);
-        await createNewSession();
+        createNewSession([]);
       }
     }
 
@@ -177,17 +172,22 @@ export default function VozhiApp() {
   }, [theme]);
 
   useEffect(() => {
-    if (session && messages.length > 0) {
+    const hasUserMessage = messages.some((message) => message.role === "user");
+    if (session && messages.length > 0 && hasUserMessage) {
       const firstUser = messages.find((message) => message.role === "user");
       const newTitle = firstUser
-        ? firstUser.content.length > 25
-          ? `${firstUser.content.substring(0, 25)}...`
-          : firstUser.content
+        ? (() => {
+            const titleSource =
+              firstUser.content.trim() ||
+              firstUser.attachments?.map((attachment) => attachment.name).join(", ") ||
+              "New Conversation";
+            return titleSource.length > 25 ? `${titleSource.substring(0, 25)}...` : titleSource;
+          })()
         : "New Conversation";
 
       setHistory((prev) =>
         prev.map((chat) =>
-          chat.id === session ? { ...chat, updatedAt: Date.now(), title: newTitle } : chat,
+          chat.id === session ? { ...chat, updatedAt: Date.now(), title: newTitle, messages } : chat,
         ),
       );
 
@@ -237,7 +237,7 @@ export default function VozhiApp() {
   };
 
   const startNewChat = async () => {
-    await createNewSession();
+    createNewSession();
   };
 
   const toggleTheme = () => {
@@ -255,6 +255,14 @@ export default function VozhiApp() {
         if (loadRequestIdRef.current !== requestId) return;
         setSession(chatId);
         setMessages(data.messages);
+        return;
+      }
+
+      const localChat = history.find((chat) => chat.id === chatId);
+      if (localChat) {
+        if (loadRequestIdRef.current !== requestId) return;
+        setSession(chatId);
+        setMessages(localChat.messages);
       }
     } catch (e) {
       console.error("Failed to load chat", e);
@@ -266,7 +274,7 @@ export default function VozhiApp() {
       const res = await fetch(apiUrl(`/api/sessions/${chatId}`), {
         method: "DELETE",
       });
-      if (!res.ok) {
+      if (!res.ok && !(chatId === session && !messages.some((message) => message.role === "user"))) {
         throw new Error("Failed to delete chat");
       }
 
@@ -288,8 +296,8 @@ export default function VozhiApp() {
 
   const streamChatResponse = async (
     request: RequestInit,
-    userMessageContent: string,
-    options?: { replaceUserMessageWithTranscript?: boolean },
+    userMessage: { content: string; attachments?: Attachment[] },
+    options?: { replaceUserMessageWithTranscript?: boolean; pendingAssistantText?: string },
   ) => {
     if (!sessionRef.current) return;
 
@@ -300,12 +308,13 @@ export default function VozhiApp() {
       {
         id: userId,
         role: "user",
-        content: userMessageContent,
+        content: userMessage.content,
+        attachments: userMessage.attachments,
       },
       {
         id: assistantId,
         role: "assistant",
-        content: "",
+        content: options?.pendingAssistantText || "",
       },
     ]);
     setLoading(true);
@@ -416,7 +425,11 @@ export default function VozhiApp() {
           method: "POST",
           body: formData,
         },
-        trimmedInput || `(Uploaded Document: ${uploadedDoc.name})`,
+        {
+          content: trimmedInput,
+          attachments: [buildAttachment(uploadedDoc, "document")],
+        },
+        { pendingAssistantText: "Processing your uploaded document..." },
       );
       return;
     }
@@ -427,7 +440,7 @@ export default function VozhiApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: trimmedInput, session_id: sessionRef.current }),
       },
-      trimmedInput,
+      { content: trimmedInput },
     );
   };
 
@@ -469,14 +482,27 @@ export default function VozhiApp() {
 
         const formData = new FormData();
         formData.append("session_id", sessionRef.current);
-        formData.append("file", audioFile);
+        formData.append("audio_file", audioFile);
+        const attachments: Attachment[] = [buildAttachment(audioFile, "audio")];
+        if (uploadedDoc) {
+          formData.append("file", uploadedDoc);
+          attachments.unshift(buildAttachment(uploadedDoc, "document"));
+        }
         void streamChatResponse(
           {
             method: "POST",
             body: formData,
           },
-          "Transcribing your voice note...",
-          { replaceUserMessageWithTranscript: true },
+          {
+            content: "Transcribing your voice note...",
+            attachments,
+          },
+          {
+            replaceUserMessageWithTranscript: true,
+            pendingAssistantText: uploadedDoc
+              ? "Processing your document and transcribing your voice query..."
+              : "Transcribing your voice note...",
+          },
         );
       };
 
@@ -783,7 +809,24 @@ export default function VozhiApp() {
                     ) : (
                       <div className="flex w-full justify-end">
                         <div className="max-w-[80%] rounded-2xl rounded-br-sm bg-[#f0f0f0] px-4 py-2.5 text-[14.5px] leading-relaxed text-zinc-800 shadow-sm dark:bg-zinc-800 dark:text-zinc-100">
-                          <p className="whitespace-pre-wrap">{message.content}</p>
+                          {message.attachments && message.attachments.length > 0 && (
+                            <div className="mb-2 flex flex-wrap gap-2">
+                              {message.attachments.map((attachment) => (
+                                <span
+                                  key={attachment.id}
+                                  className="inline-flex items-center gap-1.5 rounded-full border border-zinc-300 bg-white/75 px-2.5 py-1 text-[11px] font-medium text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                                >
+                                  {attachment.kind === "audio" ? (
+                                    <Headphones className="h-3.5 w-3.5 text-emerald-600" />
+                                  ) : (
+                                    <FileText className="h-3.5 w-3.5 text-blue-600" />
+                                  )}
+                                  {attachment.name}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          {message.content.trim() && <p className="whitespace-pre-wrap">{message.content}</p>}
                         </div>
                       </div>
                     )}
@@ -811,11 +854,17 @@ export default function VozhiApp() {
               <div className="pointer-events-auto flex min-h-[56px] w-full max-w-[760px] flex-col items-center rounded-2xl border border-zinc-200 bg-white shadow-lg ring-1 ring-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:ring-zinc-800">
                 {uploadedDoc && (
                   <div className="flex w-full items-center justify-between border-b border-zinc-100 px-4 pb-1 pt-3 dark:border-zinc-800">
-                    <span className="flex items-center gap-1.5 rounded-md bg-zinc-100 px-2 py-1 text-xs font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-200">
-                      <FileText className="h-3.5 w-3.5 text-blue-600" /> {uploadedDoc.name}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="flex items-center gap-1.5 rounded-md bg-zinc-100 px-2 py-1 text-xs font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-200">
+                        <FileText className="h-3.5 w-3.5 text-blue-600" /> {uploadedDoc.name}
+                      </span>
+                      <span className="text-[11px] font-medium uppercase tracking-widest text-emerald-600 dark:text-emerald-400">
+                        {loading ? "Processing" : "Attached"}
+                      </span>
+                    </div>
                     <button
                       onClick={() => setUploadedDoc(null)}
+                      disabled={loading}
                       className="text-[11px] font-semibold uppercase tracking-widest text-red-500 hover:text-red-700"
                     >
                       Remove

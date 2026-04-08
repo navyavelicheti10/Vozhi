@@ -19,7 +19,7 @@ const dmSans = DM_Sans({
 export const metadata: Metadata = {
   title: "Vozhi – India's Intelligent Benefits Orchestrator",
   description:
-    "Agentic Graph-RAG AI that discovers, verifies, and bundles government schemes using LangGraph, LlamaIndex, and Groq.",
+    "Agentic Graph-RAG AI that discovers, verifies, and bundles government schemes using LangGraph, LlamaIndex, and Sarvam.",
 };
 
 export default function RootLayout({

@@ -1,4 +1,4 @@
-"""Legacy Groq wrapper used by the older non-LangGraph pipeline.
+"""Legacy Sarvam wrapper used by the older non-LangGraph pipeline.
 
 The active backend now synthesizes answers through `govassist/agents/nodes.py`.
 This module remains in the repo as reference code.
@@ -8,7 +8,7 @@ import logging
 import os
 from typing import Dict, List
 
-from groq import Groq
+from govassist.integrations.sarvam import sarvam_client
 
 logger = logging.getLogger(__name__)
 MAX_FIELD_CHARS = 280
@@ -40,16 +40,14 @@ def format_scheme_context(scheme: Dict) -> str:
     )
 
 
-class GroqLLMClient:
-    """Wraps the Groq API call for answer generation."""
+class SarvamLLMClient:
+    """Wraps the Sarvam chat completion API for answer generation."""
 
-    def __init__(self, model_name: str = "llama-3.1-8b-instant", api_key: str | None = None) -> None:
-        self.model_name = os.getenv("GROQ_MODEL", model_name)
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+    def __init__(self, model_name: str = "sarvam-m", api_key: str | None = None) -> None:
+        self.model_name = os.getenv("SARVAM_CHAT_MODEL", model_name)
+        self.api_key = api_key or os.getenv("SARVAM_API_KEY")
         if not self.api_key:
-            raise ValueError("GROQ_API_KEY is missing. Add it to your .env file.")
-
-        self.client = Groq(api_key=self.api_key)
+            raise ValueError("SARVAM_API_KEY is missing. Add it to your .env file.")
 
     def build_prompt(self, query: str, schemes: List[Dict], chat_history: List[Dict] | None = None) -> str:
         history_text = "No previous conversation."
@@ -100,14 +98,14 @@ Instructions:
                 "Try rephrasing your query or using a broader search."
             )
 
-        logger.info("Generating response from Groq model: %s", self.model_name)
+        logger.info("Generating response from Sarvam model: %s", self.model_name)
 
-        # Retry with fewer schemes if Groq rejects the request size.
+        # Retry with fewer schemes if the request size becomes too large.
         for scheme_count in (min(len(schemes), 5), min(len(schemes), 3), 1):
             subset = schemes[:scheme_count]
             prompt = self.build_prompt(query, subset, chat_history=chat_history)
             try:
-                response = self.client.chat.completions.create(
+                response = sarvam_client.chat_completion(
                     model=self.model_name,
                     messages=[
                         {
@@ -117,13 +115,14 @@ Instructions:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.2,
+                    max_tokens=1200,
                 )
-                return response.choices[0].message.content.strip()
+                return response.strip()
             except Exception as exc:
                 message = str(exc)
                 if "Request too large" in message or "tokens per minute" in message or "413" in message:
                     logger.warning(
-                        "Groq request too large with %s schemes. Retrying with fewer schemes.",
+                        "Sarvam request too large with %s schemes. Retrying with fewer schemes.",
                         scheme_count,
                     )
                     continue
@@ -133,3 +132,7 @@ Instructions:
             "I found relevant schemes, but the model request became too large. "
             "Please try a more specific question like eligibility, benefits, or documents."
         )
+
+
+# Backward-compatible alias for older imports.
+GroqLLMClient = SarvamLLMClient
